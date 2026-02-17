@@ -1,0 +1,65 @@
+
+# =========================
+# Go Binaries (CLI output)
+# =========================
+# Ignore built binary with your app name
+/myapp
+/myapp.exe
+
+# Ignore generic binaries
+bin/
+dist/
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.app
+*.out
+
+# =========================
+# Test & Coverage
+# =========================
+*.test
+*.coverprofile
+coverage.*
+coverage.out
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Go workspace (if used)
+# =========================
+go.work
+go.work.sum
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Temporary
+# =========================
+tmp/
+*.tmp

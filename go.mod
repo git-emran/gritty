@@ -6,11 +6,13 @@ require (
 	fyne.io/fyne/v2 v2.7.2
 	github.com/creack/pty v1.1.24
 	github.com/gdamore/tcell/v2 v2.13.8
+	github.com/mattn/go-runewidth v0.0.20
 )
 
 require (
 	fyne.io/systray v1.12.0 // indirect
 	github.com/BurntSushi/toml v1.5.0 // indirect
+	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fredbi/uri v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect

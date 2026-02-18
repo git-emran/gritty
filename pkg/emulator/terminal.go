@@ -1,13 +1,28 @@
 package emulator
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/mattn/go-runewidth"
+)
+
+// Color represents a 24-bit TrueColor or an ANSI color index.
+type Color uint32
+
+const (
+	ColorDefault Color = 0xFF000000 // Special value for default color
+)
 
 // Cell represents a single character on the terminal grid with its styling.
 type Cell struct {
 	Char     rune
-	FgColor  int
-	BgColor  int
-	Modified bool
+	FgColor  Color
+	BgColor  Color
+	Bold     bool
+	Italic   bool
+	Wide     bool // Whether this is the first half of a wide character
+	WideCont bool // Whether this is the second half of a wide character
+	Modified bool // Dirty flag — set when cell changes, cleared after render
 }
 
 // Terminal represents the state of the terminal emulator.
@@ -16,7 +31,16 @@ type Terminal struct {
 	Height int
 	Grid   [][]Cell
 	Cursor Cursor
-	mu     sync.Mutex
+
+	// Current styling
+	CurrentFg   Color
+	CurrentBg   Color
+	CurrentBold bool
+
+	// Dirty tracking — DirtyRows[y] is true if any cell in row y changed.
+	DirtyRows []bool
+
+	mu sync.Mutex
 }
 
 // Cursor represents the current position and state of the cursor.
@@ -31,15 +55,47 @@ func NewTerminal(width, height int) *Terminal {
 	for i := range grid {
 		grid[i] = make([]Cell, width)
 		for j := range grid[i] {
-			grid[i][j] = Cell{Char: ' '}
+			grid[i][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault}
 		}
 	}
 
+	dirtyRows := make([]bool, height)
+	for i := range dirtyRows {
+		dirtyRows[i] = true // All rows dirty initially so first render is full
+	}
+
 	return &Terminal{
-		Width:  width,
-		Height: height,
-		Grid:   grid,
-		Cursor: Cursor{X: 0, Y: 0},
+		Width:     width,
+		Height:    height,
+		Grid:      grid,
+		Cursor:    Cursor{X: 0, Y: 0},
+		CurrentFg: ColorDefault,
+		CurrentBg: ColorDefault,
+		DirtyRows: dirtyRows,
+	}
+}
+
+// ClearDirty resets all dirty flags after the renderer has consumed them.
+func (t *Terminal) ClearDirty() {
+	for i := range t.DirtyRows {
+		t.DirtyRows[i] = false
+	}
+	for y := range t.Grid {
+		for x := range t.Grid[y] {
+			t.Grid[y][x].Modified = false
+		}
+	}
+}
+
+// MarkCursorDirty marks the cursor row dirty so cursor blink triggers a partial refresh.
+func (t *Terminal) MarkCursorDirty() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Cursor.Y >= 0 && t.Cursor.Y < t.Height {
+		t.DirtyRows[t.Cursor.Y] = true
+		if t.Cursor.X >= 0 && t.Cursor.X < t.Width {
+			t.Grid[t.Cursor.Y][t.Cursor.X].Modified = true
+		}
 	}
 }
 
@@ -51,12 +107,18 @@ func (t *Terminal) PutChar(r rune) {
 }
 
 func (t *Terminal) putChar(r rune) {
+	w := runewidth.RuneWidth(r)
+	if w <= 0 {
+		return
+	}
+
 	if t.Cursor.Y >= t.Height {
 		t.scrollUp()
 		t.Cursor.Y = t.Height - 1
 	}
 
-	if t.Cursor.X >= t.Width {
+	// Wrap if at end of line or if wide char won't fit
+	if t.Cursor.X+w > t.Width {
 		t.Cursor.X = 0
 		t.Cursor.Y++
 		if t.Cursor.Y >= t.Height {
@@ -65,11 +127,31 @@ func (t *Terminal) putChar(r rune) {
 		}
 	}
 
+	// Place the character
 	t.Grid[t.Cursor.Y][t.Cursor.X] = Cell{
 		Char:     r,
+		FgColor:  t.CurrentFg,
+		BgColor:  t.CurrentBg,
+		Bold:     t.CurrentBold,
+		Wide:     w > 1,
 		Modified: true,
 	}
-	t.Cursor.X++
+	t.DirtyRows[t.Cursor.Y] = true
+
+	if w > 1 {
+		// Mark the next cell as a continuation
+		if t.Cursor.X+1 < t.Width {
+			t.Grid[t.Cursor.Y][t.Cursor.X+1] = Cell{
+				Char:     ' ',
+				FgColor:  t.CurrentFg,
+				BgColor:  t.CurrentBg,
+				WideCont: true,
+				Modified: true,
+			}
+		}
+	}
+
+	t.Cursor.X += w
 }
 
 // scrollUp scrolls the terminal grid up by one line.
@@ -77,7 +159,11 @@ func (t *Terminal) scrollUp() {
 	copy(t.Grid[0:], t.Grid[1:])
 	t.Grid[t.Height-1] = make([]Cell, t.Width)
 	for j := range t.Grid[t.Height-1] {
-		t.Grid[t.Height-1][j] = Cell{Char: ' '}
+		t.Grid[t.Height-1][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault}
+	}
+	// All rows are dirty after a scroll
+	for i := range t.DirtyRows {
+		t.DirtyRows[i] = true
 	}
 }
 
@@ -91,8 +177,9 @@ func (t *Terminal) Clear() {
 func (t *Terminal) clear() {
 	for i := range t.Grid {
 		for j := range t.Grid[i] {
-			t.Grid[i][j] = Cell{Char: ' '}
+			t.Grid[i][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 		}
+		t.DirtyRows[i] = true
 	}
 	t.Cursor = Cursor{X: 0, Y: 0}
 }
@@ -105,18 +192,19 @@ func (t *Terminal) EraseInLine(mode int) {
 }
 
 func (t *Terminal) eraseInLine(mode int) {
+	t.DirtyRows[t.Cursor.Y] = true
 	switch mode {
 	case 0: // Erase from cursor to end of line
 		for x := t.Cursor.X; x < t.Width; x++ {
-			t.Grid[t.Cursor.Y][x] = Cell{Char: ' '}
+			t.Grid[t.Cursor.Y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 		}
 	case 1: // Erase from start of line to cursor
 		for x := 0; x <= t.Cursor.X; x++ {
-			t.Grid[t.Cursor.Y][x] = Cell{Char: ' '}
+			t.Grid[t.Cursor.Y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 		}
 	case 2: // Erase entire line
 		for x := 0; x < t.Width; x++ {
-			t.Grid[t.Cursor.Y][x] = Cell{Char: ' '}
+			t.Grid[t.Cursor.Y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 		}
 	}
 }
@@ -129,15 +217,14 @@ func (t *Terminal) DeleteChars(n int) {
 }
 
 func (t *Terminal) deleteChars(n int) {
-	if t.Cursor.X + n > t.Width {
+	if t.Cursor.X+n > t.Width {
 		n = t.Width - t.Cursor.X
 	}
-	// Shift left
 	copy(t.Grid[t.Cursor.Y][t.Cursor.X:], t.Grid[t.Cursor.Y][t.Cursor.X+n:])
-	// Fill end with spaces
 	for x := t.Width - n; x < t.Width; x++ {
-		t.Grid[t.Cursor.Y][x] = Cell{Char: ' '}
+		t.Grid[t.Cursor.Y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 	}
+	t.DirtyRows[t.Cursor.Y] = true
 }
 
 // EraseChars erases n characters at the cursor position.
@@ -148,12 +235,13 @@ func (t *Terminal) EraseChars(n int) {
 }
 
 func (t *Terminal) eraseChars(n int) {
-	if t.Cursor.X + n > t.Width {
+	if t.Cursor.X+n > t.Width {
 		n = t.Width - t.Cursor.X
 	}
 	for x := t.Cursor.X; x < t.Cursor.X+n; x++ {
-		t.Grid[t.Cursor.Y][x] = Cell{Char: ' '}
+		t.Grid[t.Cursor.Y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 	}
+	t.DirtyRows[t.Cursor.Y] = true
 }
 
 // InsertLine inserts n blank lines at the cursor's current line.
@@ -164,19 +252,21 @@ func (t *Terminal) InsertLine(n int) {
 }
 
 func (t *Terminal) insertLine(n int) {
-	if t.Cursor.Y + n > t.Height {
+	if t.Cursor.Y+n > t.Height {
 		n = t.Height - t.Cursor.Y
 	}
-	// Shift down
 	for y := t.Height - 1; y >= t.Cursor.Y+n; y-- {
 		t.Grid[y] = t.Grid[y-n]
 	}
-	// Fill with blank lines
 	for y := t.Cursor.Y; y < t.Cursor.Y+n; y++ {
 		t.Grid[y] = make([]Cell, t.Width)
 		for x := range t.Grid[y] {
-			t.Grid[y][x] = Cell{Char: ' '}
+			t.Grid[y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 		}
+	}
+	// Mark all rows from cursor down as dirty
+	for y := t.Cursor.Y; y < t.Height; y++ {
+		t.DirtyRows[y] = true
 	}
 }
 
@@ -188,23 +278,22 @@ func (t *Terminal) DeleteLine(n int) {
 }
 
 func (t *Terminal) deleteLine(n int) {
-	if t.Cursor.Y + n > t.Height {
+	if t.Cursor.Y+n > t.Height {
 		n = t.Height - t.Cursor.Y
 	}
-	// Shift up
 	for y := t.Cursor.Y; y < t.Height-n; y++ {
 		t.Grid[y] = t.Grid[y+n]
 	}
-	// Fill end with blank lines
 	for y := t.Height - n; y < t.Height; y++ {
 		t.Grid[y] = make([]Cell, t.Width)
 		for x := range t.Grid[y] {
-			t.Grid[y][x] = Cell{Char: ' '}
+			t.Grid[y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 		}
 	}
+	for y := t.Cursor.Y; y < t.Height; y++ {
+		t.DirtyRows[y] = true
+	}
 }
-
-
 
 // MoveCursor moves the cursor to the specified position.
 func (t *Terminal) MoveCursor(x, y int) {
@@ -226,9 +315,23 @@ func (t *Terminal) moveCursor(x, y int) {
 	if y >= t.Height {
 		y = t.Height - 1
 	}
+	// Mark old and new cursor rows dirty so cursor is redrawn
+	if t.Cursor.Y >= 0 && t.Cursor.Y < t.Height {
+		t.DirtyRows[t.Cursor.Y] = true
+		if t.Cursor.X >= 0 && t.Cursor.X < t.Width {
+			t.Grid[t.Cursor.Y][t.Cursor.X].Modified = true
+		}
+	}
 	t.Cursor.X = x
 	t.Cursor.Y = y
+	if y >= 0 && y < t.Height {
+		t.DirtyRows[y] = true
+		if x >= 0 && x < t.Width {
+			t.Grid[y][x].Modified = true
+		}
+	}
 }
+
 // Resize reallocates the grid if dimensions change.
 func (t *Terminal) Resize(width, height int) {
 	t.mu.Lock()
@@ -242,11 +345,10 @@ func (t *Terminal) Resize(width, height int) {
 	for i := range newGrid {
 		newGrid[i] = make([]Cell, width)
 		for j := range newGrid[i] {
-			newGrid[i][j] = Cell{Char: ' '}
+			newGrid[i][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault}
 		}
 	}
 
-	// Copy old content
 	copyMaxY := height
 	if t.Height < copyMaxY {
 		copyMaxY = t.Height
@@ -266,7 +368,12 @@ func (t *Terminal) Resize(width, height int) {
 	t.Width = width
 	t.Height = height
 
-	// Clamp cursor
+	// All rows dirty after resize
+	t.DirtyRows = make([]bool, height)
+	for i := range t.DirtyRows {
+		t.DirtyRows[i] = true
+	}
+
 	if t.Cursor.X >= width {
 		t.Cursor.X = width - 1
 	}
@@ -284,7 +391,6 @@ func (t *Terminal) Lock() {
 func (t *Terminal) Unlock() {
 	t.mu.Unlock()
 }
-
 
 func (t *Terminal) String() string {
 	res := ""

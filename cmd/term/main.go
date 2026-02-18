@@ -55,6 +55,15 @@ func main() {
 
 	done := make(chan bool)
 
+	// Keep terminal emulator and PTY in sync when the window is resized.
+	// This is critical for full-screen apps like vim/nvim — they query the
+	// PTY for its dimensions and draw exactly that many rows/columns.
+	rend.SetResizeHandler(func(cols, rows int) {
+		term.Resize(cols, rows)
+		manager.Resize(uint16(rows), uint16(cols))
+		log.Printf("Resized terminal to %dx%d", cols, rows)
+	})
+
 	// Bridge GUI keys to PTY
 	rend.SetKeyHandler(func(ev *fyne.KeyEvent) {
 		switch ev.Name {

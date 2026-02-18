@@ -1,0 +1,9 @@
+Website = "https://github.com/emranhossain/terminal_go"
+Email   = ""
+
+[Details]
+  Icon    = "assets/icon.png"
+  Name    = "Gritty"
+  ID      = "com.emranhossain.gritty"
+  Version = "1.0.0"
+  Build   = 1

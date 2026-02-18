@@ -135,8 +135,8 @@ func (p *Parser) Process(data []byte) {
 				p.state = StateNormal
 			}
 		case StateOSC:
-			if r == '\a' || r == '\x9c' {
-				// OSC finished (BEL or ST)
+			if r == '\x07' {
+				// OSC finished (BEL); ESC \ (7-bit ST) is handled below
 				p.state = StateNormal
 			} else if r == '\x1b' {
 				// ESC ST — next byte should be '\' to complete ST; consume it

@@ -62,14 +62,16 @@ func loadNerdFont() fyne.Resource {
 
 // GUIRenderer implements Renderer using Fyne.
 type GUIRenderer struct {
-	app           fyne.App
-	win           fyne.Window
-	grid          *widget.TextGrid
-	keyHandler    func(ev *fyne.KeyEvent)
-	runeHandler   func(r rune)
-	cursorVisible bool
-	stopCursor    chan bool
-	renderCh      chan struct{} // signals that a render is needed
+	app            fyne.App
+	win             fyne.Window
+	grid            *widget.TextGrid
+	keyHandler      func(ev *fyne.KeyEvent)
+	runeHandler     func(r rune)
+	resizeHandler   func(cols, rows int)
+	cursorVisible   bool
+	stopCursor      chan bool
+	renderCh        chan struct{} // signals that a render is needed
+	cellW, cellH    float32      // measured cell dimensions
 }
 
 // NewGUIRenderer creates a new GUI renderer.
@@ -98,7 +100,12 @@ func NewGUIRenderer(title string, width, height int) (*GUIRenderer, error) {
 	g.Refresh()
 
 	w.SetContent(g)
-	w.Resize(fyne.NewSize(float32(width)*9, float32(height)*18)) // approximate cell size
+
+	// Measure a single cell so we can compute exact window size and handle resizes.
+	// Use a reasonable default; Fyne will refine once the window is shown.
+	cellW := float32(9.0)
+	cellH := float32(18.0)
+	w.Resize(fyne.NewSize(cellW*float32(width), cellH*float32(height)))
 
 	r := &GUIRenderer{
 		app:           a,
@@ -107,7 +114,31 @@ func NewGUIRenderer(title string, width, height int) (*GUIRenderer, error) {
 		cursorVisible: true,
 		stopCursor:    make(chan bool),
 		renderCh:      make(chan struct{}, 1),
+		cellW:         cellW,
+		cellH:         cellH,
 	}
+
+	// Notify resize handler when the window changes size.
+	w.Canvas().SetOnTypedKey(nil) // placeholder; real handler set below
+	var lastCols, lastRows int = width, height
+	go func() {
+		for {
+			time.Sleep(150 * time.Millisecond)
+			size := w.Canvas().Size()
+			cols := int(size.Width / r.cellW)
+			rows := int(size.Height / r.cellH)
+			if cols < 1 {
+				cols = 1
+			}
+			if rows < 1 {
+				rows = 1
+			}
+			if (cols != lastCols || rows != lastRows) && r.resizeHandler != nil {
+				lastCols, lastRows = cols, rows
+				r.resizeHandler(cols, rows)
+			}
+		}
+	}()
 
 	w.Canvas().SetOnTypedKey(func(ev *fyne.KeyEvent) {
 		if r.keyHandler != nil {
@@ -120,6 +151,7 @@ func NewGUIRenderer(title string, width, height int) (*GUIRenderer, error) {
 			r.runeHandler(rn)
 		}
 	})
+
 
 	// Cursor blink goroutine — just toggles the flag and signals a render
 	go func() {
@@ -207,18 +239,16 @@ func (r *GUIRenderer) Render(t *emulator.Terminal) {
 				char = ' '
 			}
 
-			// Render cursor
-			isCursor := (x == t.Cursor.X && y == t.Cursor.Y)
-			if isCursor && r.cursorVisible {
-				if char == ' ' {
-					char = '█'
-				}
-			}
-
 			if cell.WideCont {
 				// Leave continuation cells as space
 				r.grid.Rows[y].Cells[x] = widget.TextGridCell{Rune: ' '}
 				continue
+			}
+
+			// Render cursor — slim left-half-block '▌' in theme-aware color
+			isCursor := (x == t.Cursor.X && y == t.Cursor.Y)
+			if isCursor && r.cursorVisible {
+				char = '▌'
 			}
 
 			gridCell := widget.TextGridCell{Rune: char}
@@ -235,11 +265,10 @@ func (r *GUIRenderer) Render(t *emulator.Terminal) {
 					style.BGColor = emulatorColorToFyne(cell.BgColor)
 				}
 				if isCursor && r.cursorVisible {
-					// Invert colors for cursor block
-					if !hasFg {
-						style.BGColor = color.RGBA{200, 200, 200, 255}
-						style.FGColor = color.RGBA{0, 0, 0, 255}
-					}
+					// Use theme foreground color for cursor so it's white in dark
+					// mode and black in light mode.
+					style.FGColor = theme.ForegroundColor()
+					style.BGColor = nil // transparent background — cursor is just the glyph
 				}
 				gridCell.Style = style
 			}
@@ -295,6 +324,12 @@ func (r *GUIRenderer) SetRuneHandler(h func(rn rune)) {
 	r.runeHandler = h
 }
 
+// SetResizeHandler sets a callback invoked when the window is resized.
+// cols and rows are the new terminal dimensions in characters.
+func (r *GUIRenderer) SetResizeHandler(h func(cols, rows int)) {
+	r.resizeHandler = h
+}
+
 // RenderCh returns the channel that signals a render is needed (e.g. cursor blink).
 func (r *GUIRenderer) RenderCh() <-chan struct{} {
 	return r.renderCh
@@ -311,7 +346,16 @@ func (r *GUIRenderer) Close() {
 	r.win.Close()
 }
 
-// Size returns the grid dimensions.
+// Size returns the current grid dimensions based on window size.
 func (r *GUIRenderer) Size() (int, int) {
-	return 80, 24
+	size := r.win.Canvas().Size()
+	cols := int(size.Width / r.cellW)
+	rows := int(size.Height / r.cellH)
+	if cols < 1 {
+		cols = 1
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	return cols, rows
 }

@@ -3,12 +3,11 @@ package main
 import (
 	"log"
 	"os"
-	"time"
 
-	"fyne.io/fyne/v2"
 	"github.com/emranhossain/terminal_go/pkg/emulator"
 	"github.com/emranhossain/terminal_go/pkg/pty"
 	"github.com/emranhossain/terminal_go/pkg/renderer"
+	"github.com/hajimehoshi/ebiten/v2"
 )
 
 func main() {
@@ -18,13 +17,13 @@ func main() {
 		log.SetOutput(f)
 		defer f.Close()
 	}
-	log.Println("Starting GUI terminal...")
+	log.Println("Starting Ebitengine terminal...")
 
 	// Fixed dimensions for now
 	width, height := 80, 24
 
 	// Initialize GUI Renderer
-	rend, err := renderer.NewGUIRenderer("Go Terminal", width, height)
+	rend, err := renderer.NewGUIRenderer("Gritty Terminal", width, height)
 	if err != nil {
 		log.Fatalf("failed to create renderer: %v", err)
 	}
@@ -56,8 +55,6 @@ func main() {
 	done := make(chan bool)
 
 	// Keep terminal emulator and PTY in sync when the window is resized.
-	// This is critical for full-screen apps like vim/nvim — they query the
-	// PTY for its dimensions and draw exactly that many rows/columns.
 	rend.SetResizeHandler(func(cols, rows int) {
 		term.Resize(cols, rows)
 		manager.Resize(uint16(rows), uint16(cols))
@@ -65,33 +62,33 @@ func main() {
 	})
 
 	// Bridge GUI keys to PTY
-	rend.SetKeyHandler(func(ev *fyne.KeyEvent) {
-		switch ev.Name {
-		case fyne.KeyReturn, fyne.KeyEnter:
+	rend.SetKeyHandler(func(key ebiten.Key) {
+		switch key {
+		case ebiten.KeyEnter, ebiten.KeyNumpadEnter:
 			manager.Write([]byte{'\r'})
-		case fyne.KeyBackspace:
+		case ebiten.KeyBackspace:
 			manager.Write([]byte{0x7f})
-		case fyne.KeyTab:
+		case ebiten.KeyTab:
 			manager.Write([]byte{'\t'})
-		case fyne.KeyUp:
+		case ebiten.KeyUp:
 			manager.Write([]byte("\x1b[A"))
-		case fyne.KeyDown:
+		case ebiten.KeyDown:
 			manager.Write([]byte("\x1b[B"))
-		case fyne.KeyRight:
+		case ebiten.KeyRight:
 			manager.Write([]byte("\x1b[C"))
-		case fyne.KeyLeft:
+		case ebiten.KeyLeft:
 			manager.Write([]byte("\x1b[D"))
-		case fyne.KeyHome:
+		case ebiten.KeyHome:
 			manager.Write([]byte("\x1b[H"))
-		case fyne.KeyEnd:
+		case ebiten.KeyEnd:
 			manager.Write([]byte("\x1b[F"))
-		case fyne.KeyPageUp:
+		case ebiten.KeyPageUp:
 			manager.Write([]byte("\x1b[5~"))
-		case fyne.KeyPageDown:
+		case ebiten.KeyPageDown:
 			manager.Write([]byte("\x1b[6~"))
-		case fyne.KeyDelete:
+		case ebiten.KeyDelete:
 			manager.Write([]byte("\x1b[3~"))
-		case fyne.KeyEscape:
+		case ebiten.KeyEscape:
 			manager.Write([]byte{0x1b})
 		}
 	})
@@ -100,12 +97,8 @@ func main() {
 		manager.Write([]byte(string(rn)))
 	})
 
-	// Render trigger channel — batches rapid output into at most ~60fps renders
-	renderTrigger := make(chan struct{}, 1)
-
 	// Read from PTY and update terminal state
 	go func() {
-		// 32KB buffer — much larger than before to handle burst output efficiently
 		buf := make([]byte, 32768)
 		for {
 			n, err := manager.Read(buf)
@@ -116,34 +109,6 @@ func main() {
 			}
 			if n > 0 {
 				parser.Process(buf[:n])
-				// Signal render needed (non-blocking, coalesces multiple reads)
-				select {
-				case renderTrigger <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
-
-	// Render loop — drains renderTrigger at most every ~16ms (≈60fps)
-	go func() {
-		ticker := time.NewTicker(16 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// Check if there's a pending render signal
-				select {
-				case <-renderTrigger:
-					rend.Render(term)
-				default:
-				}
-			case <-rend.RenderCh():
-				// Cursor blink triggered a render
-				term.MarkCursorDirty()
-				rend.Render(term)
-			case <-done:
-				return
 			}
 		}
 	}()
@@ -151,9 +116,9 @@ func main() {
 	// Wait for shell to exit
 	go func() {
 		<-done
-		rend.Close()
+		os.Exit(0)
 	}()
 
-	// Start Fyne event loop
-	rend.ShowAndRun()
+	// Start Ebitengine event loop
+	rend.ShowAndRun(term)
 }

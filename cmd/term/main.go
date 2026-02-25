@@ -121,6 +121,20 @@ func main() {
 		manager.Write([]byte(string(rn)))
 	})
 
+	var scrollAccum float64
+	rend.SetWheelHandler(func(dx, dy float64) {
+		scrollAccum += dy
+		if scrollAccum >= 1.0 {
+			lines := int(scrollAccum)
+			scrollAccum -= float64(lines)
+			term.ScrollUpLines(lines)
+		} else if scrollAccum <= -1.0 {
+			lines := int(-scrollAccum)
+			scrollAccum += float64(lines)
+			term.ScrollDownLines(lines)
+		}
+	})
+
 	// Read from PTY and update terminal state
 	go func() {
 		buf := make([]byte, 32768)

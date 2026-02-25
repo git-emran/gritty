@@ -46,6 +46,7 @@ type GUIRenderer struct {
 	resizeHandler func(cols, rows int)
 	keyHandler    func(key ebiten.Key)
 	runeHandler   func(rn rune)
+	wheelHandler  func(dx, dy float64)
 
 	term *emulator.Terminal
 }
@@ -149,6 +150,14 @@ func (r *GUIRenderer) cursorBlink() {
 }
 
 func (r *GUIRenderer) Update() error {
+	if r.wheelHandler != nil {
+		dx, dy := ebiten.Wheel()
+		if dx != 0 || dy != 0 {
+			log.Printf("Wheel Event: dx=%f, dy=%f\n", dx, dy)
+			r.wheelHandler(dx, dy)
+		}
+	}
+
 	// Handle input
 	if r.keyHandler != nil {
 		runes := ebiten.AppendInputChars(nil)
@@ -206,6 +215,9 @@ func (r *GUIRenderer) Draw(screen *ebiten.Image) {
 
 	r.renderTerm(r.term)
 
+	bg := emulatorColorToRGBA(emulator.ColorDefault, false)
+	screen.Fill(bg)
+
 	screen.DrawImage(r.framebuffer, nil)
 }
 
@@ -241,32 +253,57 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 	}
 
 	t.Lock()
-	defer t.Unlock()
-
 	if t.Width <= 0 || t.Height <= 0 {
+		t.Unlock()
 		return false
 	}
 
-	forceFull := false
-	if len(r.prevBuffer) != t.Height || (len(r.prevBuffer) > 0 && len(r.prevBuffer[0]) != t.Width) {
-		r.prevBuffer = make([][]cellSnapshot, t.Height)
-		for y := range r.prevBuffer {
-			r.prevBuffer[y] = make([]cellSnapshot, t.Width)
-		}
-		forceFull = true
-	}
-
+	width := t.Width
+	height := t.Height
 	shift := t.PendingScroll
 	t.PendingScroll = 0
 
 	cx, cy, cursorInView := t.CursorViewPosition()
+
+	forceFull := false
+	if t.ForceRedraw {
+		forceFull = true
+		t.ForceRedraw = false
+	}
+
+	if len(r.prevBuffer) != height || (len(r.prevBuffer) > 0 && len(r.prevBuffer[0]) != width) {
+		r.prevBuffer = make([][]cellSnapshot, height)
+		for y := range r.prevBuffer {
+			r.prevBuffer[y] = make([]cellSnapshot, width)
+		}
+		forceFull = true
+	}
+
+	dirtyRows := make([]bool, len(t.DirtyRows))
+	copy(dirtyRows, t.DirtyRows)
+	for y := 0; y < len(t.DirtyRows); y++ {
+		t.DirtyRows[y] = false
+	}
+
+	viewRows := make([][]emulator.Cell, height)
+	for y := 0; y < height; y++ {
+		if forceFull || shift > 0 || (y < len(dirtyRows) && dirtyRows[y]) {
+			row := t.ViewRow(y)
+			if row != nil {
+				viewRows[y] = make([]emulator.Cell, len(row))
+				copy(viewRows[y], row)
+			}
+		}
+	}
+	t.Unlock()
+
 	cursorChanged := r.prevCursorX != cx || r.prevCursorY != cy
 	cursorVisibilityChanged := r.cursorVisible != r.lastCursorVisible
 
 	hasDirtyRows := forceFull || shift > 0
 	if !hasDirtyRows {
-		for y := 0; y < len(t.DirtyRows); y++ {
-			if t.DirtyRows[y] {
+		for y := 0; y < len(dirtyRows); y++ {
+			if dirtyRows[y] {
 				hasDirtyRows = true
 				break
 			}
@@ -286,15 +323,15 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 		r.framebuffer, r.backbuffer = r.backbuffer, r.framebuffer
 
 		// Shift prevBuffer so we don't redraw everything
-		if shift < t.Height {
+		if shift < height {
 			copy(r.prevBuffer[0:], r.prevBuffer[shift:])
-			for y := t.Height - shift; y < t.Height; y++ {
+			for y := height - shift; y < height; y++ {
 				for x := range r.prevBuffer[y] {
 					r.prevBuffer[y][x] = cellSnapshot{}
 				}
 			}
 		} else {
-			for y := 0; y < t.Height; y++ {
+			for y := 0; y < height; y++ {
 				for x := range r.prevBuffer[y] {
 					r.prevBuffer[y][x] = cellSnapshot{}
 				}
@@ -303,12 +340,12 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 	}
 
 	changed := shift > 0
-	for y := 0; y < t.Height; y++ {
-		if !forceFull && (y >= len(t.DirtyRows) || !t.DirtyRows[y]) {
+	for y := 0; y < height; y++ {
+		if !forceFull && (y >= len(dirtyRows) || !dirtyRows[y]) {
 			continue
 		}
-		row := t.ViewRow(y)
-		for x := 0; x < t.Width; x++ {
+		row := viewRows[y]
+		for x := 0; x < width; x++ {
 			cell := emulator.Cell{Char: ' ', FgColor: emulator.ColorDefault, BgColor: emulator.ColorDefault}
 			if row != nil && x < len(row) {
 				cell = row[x]
@@ -324,9 +361,6 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 				r.drawCellGPU(x, y, snap)
 				changed = true
 			}
-		}
-		if y < len(t.DirtyRows) {
-			t.DirtyRows[y] = false
 		}
 	}
 
@@ -372,6 +406,7 @@ func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
 	opts.GeoM.Scale(float64(r.cellW), float64(r.cellH))
 	opts.GeoM.Translate(px, py)
 	opts.ColorScale.ScaleWithColor(bg)
+	opts.CompositeMode = ebiten.CompositeModeCopy
 	r.framebuffer.DrawImage(r.whitePixel, opts)
 
 	if snap.char == ' ' || r.face == nil {
@@ -433,6 +468,10 @@ func (r *GUIRenderer) SetKeyHandler(h func(key ebiten.Key)) {
 
 func (r *GUIRenderer) SetRuneHandler(h func(rn rune)) {
 	r.runeHandler = h
+}
+
+func (r *GUIRenderer) SetWheelHandler(h func(dx, dy float64)) {
+	r.wheelHandler = h
 }
 
 func (r *GUIRenderer) Close() {

@@ -1,6 +1,7 @@
 package emulator
 
 import (
+	"log"
 	"sync"
 
 	"github.com/mattn/go-runewidth"
@@ -42,8 +43,9 @@ type Terminal struct {
 	CurrentBold bool
 
 	// Dirty tracking — DirtyRows[y] is true if any cell in row y changed.
-	DirtyRows []bool
+	DirtyRows     []bool
 	PendingScroll int
+	ForceRedraw   bool
 
 	mu sync.Mutex
 }
@@ -79,6 +81,7 @@ func NewTerminal(width, height int) *Terminal {
 		CurrentFg:     ColorDefault,
 		CurrentBg:     ColorDefault,
 		DirtyRows:     dirtyRows,
+		ForceRedraw:   true,
 	}
 }
 
@@ -93,6 +96,7 @@ func (t *Terminal) markAllDirty() {
 	for i := range t.DirtyRows {
 		t.DirtyRows[i] = true
 	}
+	t.ForceRedraw = true
 }
 
 // MarkCursorDirty marks the cursor row dirty so cursor blink triggers a partial refresh.
@@ -183,7 +187,9 @@ func (t *Terminal) scrollUp() {
 		t.Grid[t.Height-1][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 	}
 	t.DirtyRows[t.Height-1] = true
-	t.PendingScroll++
+	if t.ViewOffset == 0 {
+		t.PendingScroll++
+	}
 }
 
 // Clear clears the terminal grid.
@@ -202,6 +208,7 @@ func (t *Terminal) clear() {
 	}
 	t.Cursor = Cursor{X: 0, Y: 0}
 	t.ViewOffset = 0
+	t.ForceRedraw = true
 }
 
 // EraseInLine erases parts of the current line.
@@ -361,35 +368,59 @@ func (t *Terminal) Resize(width, height int) {
 		return
 	}
 
-	newGrid := make([][]Cell, height)
-	for i := range newGrid {
-		newGrid[i] = make([]Cell, width)
-		for j := range newGrid[i] {
-			newGrid[i][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault}
+	if height < t.Height {
+		linesToPush := t.Height - height
+		for i := 0; i < linesToPush; i++ {
+			t.Scrollback = append(t.Scrollback, t.Grid[i])
 		}
-	}
-
-	copyMaxY := height
-	if t.Height < copyMaxY {
-		copyMaxY = t.Height
-	}
-	copyMaxX := width
-	if t.Width < copyMaxX {
-		copyMaxX = t.Width
-	}
-
-	for y := 0; y < copyMaxY; y++ {
-		for x := 0; x < copyMaxX; x++ {
-			newGrid[y][x] = t.Grid[y][x]
+		if len(t.Scrollback) > t.MaxScrollback {
+			t.Scrollback = t.Scrollback[len(t.Scrollback)-t.MaxScrollback:]
 		}
+		for y := 0; y < height; y++ {
+			t.Grid[y] = t.Grid[y+linesToPush]
+		}
+		t.Height = height
+		t.Cursor.Y -= linesToPush
+		if t.Cursor.Y < 0 {
+			t.Cursor.Y = 0
+		}
+	} else if height > t.Height {
+		added := height - t.Height
+		pull := added
+		if pull > len(t.Scrollback) {
+			pull = len(t.Scrollback)
+		}
+		for i := 0; i < added; i++ {
+			t.Grid = append(t.Grid, nil)
+		}
+		for y := t.Height - 1; y >= 0; y-- {
+			t.Grid[y+pull] = t.Grid[y]
+		}
+		for i := 0; i < pull; i++ {
+			sbIdx := len(t.Scrollback) - pull + i
+			t.Grid[i] = t.Scrollback[sbIdx]
+		}
+		t.Scrollback = t.Scrollback[:len(t.Scrollback)-pull]
+		t.Height = height
+		t.Cursor.Y += pull
 	}
 
-	t.Grid = newGrid
+	for y := 0; y < t.Height; y++ {
+		row := t.Grid[y]
+		newRow := make([]Cell, width)
+		for x := 0; x < width; x++ {
+			if row != nil && x < len(row) {
+				newRow[x] = row[x]
+			} else {
+				newRow[x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault}
+			}
+		}
+		t.Grid[y] = newRow
+	}
+
 	t.Width = width
-	t.Height = height
 
-	// All rows dirty after resize
-	t.DirtyRows = make([]bool, height)
+	t.DirtyRows = make([]bool, t.Height)
 	for i := range t.DirtyRows {
 		t.DirtyRows[i] = true
 	}
@@ -403,6 +434,8 @@ func (t *Terminal) Resize(width, height int) {
 	if t.ViewOffset > len(t.Scrollback) {
 		t.ViewOffset = len(t.Scrollback)
 	}
+	t.PendingScroll = 0
+	t.ForceRedraw = true
 }
 
 func (t *Terminal) maxViewOffsetLocked() int {
@@ -420,10 +453,11 @@ func (t *Terminal) ScrollUpLines(lines int) {
 	}
 	t.ViewOffset += lines
 	max := t.maxViewOffsetLocked()
+	log.Printf("ScrollUpLines: lines=%d, viewOffset=%d, max=%d\n", lines, t.ViewOffset, max)
 	if t.ViewOffset > max {
 		t.ViewOffset = max
 	}
-	t.markAllDirty()
+	t.ForceRedraw = true
 }
 
 func (t *Terminal) ScrollDownLines(lines int) {
@@ -433,10 +467,11 @@ func (t *Terminal) ScrollDownLines(lines int) {
 		return
 	}
 	t.ViewOffset -= lines
+	log.Printf("ScrollDownLines: lines=%d, viewOffset=%d\n", lines, t.ViewOffset)
 	if t.ViewOffset < 0 {
 		t.ViewOffset = 0
 	}
-	t.markAllDirty()
+	t.ForceRedraw = true
 }
 
 func (t *Terminal) ScrollPageUp() {
@@ -462,7 +497,7 @@ func (t *Terminal) ScrollToBottom() {
 		return
 	}
 	t.ViewOffset = 0
-	t.markAllDirty()
+	t.ForceRedraw = true
 }
 
 // ViewRow returns the visible row at y in the current viewport.

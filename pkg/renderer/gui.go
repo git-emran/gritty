@@ -3,7 +3,6 @@ package renderer
 import (
 	"image"
 	"image/color"
-	"image/draw"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,8 +18,10 @@ import (
 )
 
 type GUIRenderer struct {
-	img *image.RGBA
-	screen *ebiten.Image
+	framebuffer *ebiten.Image
+	backbuffer  *ebiten.Image
+	glyphCache  map[rune]*ebiten.Image
+	whitePixel  *ebiten.Image
 
 	width  int
 	height int
@@ -32,12 +33,13 @@ type GUIRenderer struct {
 
 	prevBuffer [][]cellSnapshot
 
-	cursorVisible bool
-	prevCursorX   int
-	prevCursorY   int
+	cursorVisible     bool
+	lastCursorVisible bool
+	prevCursorX       int
+	prevCursorY       int
 
-	renderCh   chan struct{}
-	
+	renderCh chan struct{}
+
 	mu sync.Mutex
 
 	// Handlers
@@ -89,27 +91,34 @@ func loadNerdFontFace(size float64) font.Face {
 		}
 	}
 
-	// If no Nerd Font found, we'll try a basic font or at least return something valid
-	// For now, let's assume one of these exists. If not, this might panic or return nil.
-	// In a real app we'd bundle a font.
-	return nil 
+	return nil
 }
 
 func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 	cellW := 9
 	cellH := 18
 
-	img := image.NewRGBA(image.Rect(0, 0, cols*cellW, rows*cellH))
+	fb := ebiten.NewImage(cols*cellW, rows*cellH)
+	bb := ebiten.NewImage(cols*cellW, rows*cellH)
+
+	wp := ebiten.NewImage(1, 1)
+	wp.Fill(color.White)
 
 	r := &GUIRenderer{
-		img:          img,
-		width:        cols,
-		height:       rows,
-		cellW:        cellW,
-		cellH:        cellH,
-		face:         loadNerdFontFace(14),
-		renderCh:     make(chan struct{}, 1),
-		cursorVisible: true,
+		framebuffer:       fb,
+		backbuffer:        bb,
+		glyphCache:        make(map[rune]*ebiten.Image),
+		whitePixel:        wp,
+		width:             cols,
+		height:            rows,
+		cellW:             cellW,
+		cellH:             cellH,
+		face:              loadNerdFontFace(14),
+		renderCh:          make(chan struct{}, 1),
+		cursorVisible:     true,
+		lastCursorVisible: true,
+		prevCursorX:       -1,
+		prevCursorY:       -1,
 	}
 
 	r.prevBuffer = make([][]cellSnapshot, rows)
@@ -128,37 +137,27 @@ func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 func (r *GUIRenderer) cursorBlink() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	for {
+	for range ticker.C {
+		r.mu.Lock()
+		r.cursorVisible = !r.cursorVisible
+		r.mu.Unlock()
 		select {
-		case <-ticker.C:
-			r.mu.Lock()
-			r.cursorVisible = !r.cursorVisible
-			r.mu.Unlock()
-			select {
-			case r.renderCh <- struct{}{}:
-			default:
-			}
+		case r.renderCh <- struct{}{}:
+		default:
 		}
 	}
 }
 
-// Update implements ebiten.Game
 func (r *GUIRenderer) Update() error {
 	// Handle input
 	if r.keyHandler != nil {
-		// This is a bit simplified, but Ebitengine handles repeats too.
-		// For a terminal, we need character events and special keys.
-		
-		// Runes
-		var runes []rune
-		runes = ebiten.AppendInputChars(runes[:0])
+		runes := ebiten.AppendInputChars(nil)
 		for _, rn := range runes {
 			if r.runeHandler != nil {
 				r.runeHandler(rn)
 			}
 		}
 
-		// Special keys
 		keys := []ebiten.Key{
 			ebiten.KeyEnter, ebiten.KeyBackspace, ebiten.KeyTab,
 			ebiten.KeyUp, ebiten.KeyDown, ebiten.KeyLeft, ebiten.KeyRight,
@@ -181,12 +180,16 @@ func (r *GUIRenderer) Update() error {
 		if newCols > 0 && newRows > 0 {
 			r.width = newCols
 			r.height = newRows
-			r.img = image.NewRGBA(image.Rect(0, 0, r.width*r.cellW, r.height*r.cellH))
-			
+			r.framebuffer = ebiten.NewImage(r.width*r.cellW, r.height*r.cellH)
+			r.backbuffer = ebiten.NewImage(r.width*r.cellW, r.height*r.cellH)
+
 			r.prevBuffer = make([][]cellSnapshot, r.height)
 			for y := range r.prevBuffer {
 				r.prevBuffer[y] = make([]cellSnapshot, r.width)
 			}
+
+			r.prevCursorX = -1
+			r.prevCursorY = -1
 
 			if r.resizeHandler != nil {
 				r.resizeHandler(newCols, newRows)
@@ -197,138 +200,214 @@ func (r *GUIRenderer) Update() error {
 	return nil
 }
 
-// Draw implements ebiten.Game
 func (r *GUIRenderer) Draw(screen *ebiten.Image) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.term != nil {
-		r.renderTerm(r.term)
-	}
+	r.renderTerm(r.term)
 
-	if r.screen == nil || r.screen.Bounds().Dx() != r.img.Bounds().Dx() || r.screen.Bounds().Dy() != r.img.Bounds().Dy() {
-		r.screen = ebiten.NewImageFromImage(r.img)
-	} else {
-		r.screen.WritePixels(r.img.Pix)
-	}
-
-	screen.DrawImage(r.screen, nil)
+	screen.DrawImage(r.framebuffer, nil)
 }
 
-// Layout implements ebiten.Game
 func (r *GUIRenderer) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return outsideWidth, outsideHeight
 }
 
-func (r *GUIRenderer) renderTerm(t *emulator.Terminal) {
+func (r *GUIRenderer) getGlyph(char rune) *ebiten.Image {
+	if img, ok := r.glyphCache[char]; ok {
+		return img
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, r.cellW, r.cellH))
+
+	if r.face != nil {
+		d := font.Drawer{
+			Dst:  img,
+			Src:  image.NewUniform(color.White),
+			Face: r.face,
+		}
+		d.Dot = fixed.P(0, r.cellH-4)
+		d.DrawString(string(char))
+	}
+
+	eImg := ebiten.NewImageFromImage(img)
+	r.glyphCache[char] = eImg
+	return eImg
+}
+
+func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
+	if t == nil {
+		return false
+	}
+
 	t.Lock()
 	defer t.Unlock()
 
-	// Ensure prevBuffer is the right size (in case terminal resized but we didn't update yet)
+	if t.Width <= 0 || t.Height <= 0 {
+		return false
+	}
+
+	forceFull := false
 	if len(r.prevBuffer) != t.Height || (len(r.prevBuffer) > 0 && len(r.prevBuffer[0]) != t.Width) {
 		r.prevBuffer = make([][]cellSnapshot, t.Height)
 		for y := range r.prevBuffer {
 			r.prevBuffer[y] = make([]cellSnapshot, t.Width)
 		}
+		forceFull = true
 	}
 
-	for y := 0; y < t.Height; y++ {
-		for x := 0; x < t.Width; x++ {
-			if y >= len(t.Grid) || x >= len(t.Grid[y]) {
-				continue
-			}
-			cell := t.Grid[y][x]
+	shift := t.PendingScroll
+	t.PendingScroll = 0
 
+	cx, cy, cursorInView := t.CursorViewPosition()
+	cursorChanged := r.prevCursorX != cx || r.prevCursorY != cy
+	cursorVisibilityChanged := r.cursorVisible != r.lastCursorVisible
+
+	hasDirtyRows := forceFull || shift > 0
+	if !hasDirtyRows {
+		for y := 0; y < len(t.DirtyRows); y++ {
+			if t.DirtyRows[y] {
+				hasDirtyRows = true
+				break
+			}
+		}
+	}
+
+	if !hasDirtyRows && !cursorChanged && !cursorVisibilityChanged {
+		return false
+	}
+
+	// Process hardware scrolling
+	if shift > 0 && !forceFull {
+		r.backbuffer.Clear()
+		opts := &ebiten.DrawImageOptions{}
+		opts.GeoM.Translate(0, float64(-shift*r.cellH))
+		r.backbuffer.DrawImage(r.framebuffer, opts)
+		r.framebuffer, r.backbuffer = r.backbuffer, r.framebuffer
+
+		// Shift prevBuffer so we don't redraw everything
+		if shift < t.Height {
+			copy(r.prevBuffer[0:], r.prevBuffer[shift:])
+			for y := t.Height - shift; y < t.Height; y++ {
+				for x := range r.prevBuffer[y] {
+					r.prevBuffer[y][x] = cellSnapshot{}
+				}
+			}
+		} else {
+			for y := 0; y < t.Height; y++ {
+				for x := range r.prevBuffer[y] {
+					r.prevBuffer[y][x] = cellSnapshot{}
+				}
+			}
+		}
+	}
+
+	changed := shift > 0
+	for y := 0; y < t.Height; y++ {
+		if !forceFull && (y >= len(t.DirtyRows) || !t.DirtyRows[y]) {
+			continue
+		}
+		row := t.ViewRow(y)
+		for x := 0; x < t.Width; x++ {
+			cell := emulator.Cell{Char: ' ', FgColor: emulator.ColorDefault, BgColor: emulator.ColorDefault}
+			if row != nil && x < len(row) {
+				cell = row[x]
+			}
 			char := cell.Char
 			if char == 0 || cell.WideCont {
 				char = ' '
 			}
 
-			snap := cellSnapshot{
-				char: char,
-				fg:   cell.FgColor,
-				bg:   cell.BgColor,
-			}
-
-			if y < len(r.prevBuffer) && x < len(r.prevBuffer[y]) && snap != r.prevBuffer[y][x] {
+			snap := cellSnapshot{char: char, fg: cell.FgColor, bg: cell.BgColor}
+			if forceFull || snap != r.prevBuffer[y][x] {
 				r.prevBuffer[y][x] = snap
-				r.drawCell(x, y, snap)
+				r.drawCellGPU(x, y, snap)
+				changed = true
 			}
+		}
+		if y < len(t.DirtyRows) {
+			t.DirtyRows[y] = false
 		}
 	}
 
-	// cursor
-	cx := t.Cursor.X
-	cy := t.Cursor.Y
-
-	if r.prevCursorX != cx || r.prevCursorY != cy {
-		r.redrawFromBuffer(r.prevCursorX, r.prevCursorY)
+	if cursorChanged || cursorVisibilityChanged {
+		if r.redrawFromBuffer(r.prevCursorX, r.prevCursorY) {
+			changed = true
+		}
 	}
 
-	if r.cursorVisible {
-		r.drawCursor(cx, cy)
+	if cursorInView && r.cursorVisible {
+		r.drawCursorGPU(cx, cy)
+		changed = true
 	}
 
 	r.prevCursorX = cx
 	r.prevCursorY = cy
+	r.lastCursorVisible = r.cursorVisible
+
+	return changed
 }
 
-func (r *GUIRenderer) drawCell(x, y int, snap cellSnapshot) {
-	px := x * r.cellW
-	py := y * r.cellH
-
-	bg := emulatorColorToRGBA(snap.bg)
-	draw.Draw(r.img, image.Rect(px, py, px+r.cellW, py+r.cellH),
-		&image.Uniform{bg}, image.Point{}, draw.Src)
-
-	if snap.char == ' ' {
-		return
-	}
-
-	fg := emulatorColorToRGBA(snap.fg)
-
-	if r.face != nil {
-		d := &font.Drawer{
-			Dst:  r.img,
-			Src:  image.NewUniform(fg),
-			Face: r.face,
-			Dot:  fixed.P(px, py+r.cellH-4),
-		}
-		d.DrawString(string(snap.char))
-	}
-}
-
-func (r *GUIRenderer) redrawFromBuffer(x, y int) {
-	if x < 0 || y < 0 || y >= r.height || x >= r.width {
-		return
-	}
-	if y >= len(r.prevBuffer) || x >= len(r.prevBuffer[y]) {
-		return
-	}
-	snap := r.prevBuffer[y][x]
-	r.drawCell(x, y, snap)
-}
-
-func (r *GUIRenderer) drawCursor(x, y int) {
-	px := x * r.cellW
-	py := y * r.cellH
-
-	draw.Draw(r.img,
-		image.Rect(px, py, px+2, py+r.cellH),
-		&image.Uniform{color.White},
-		image.Point{},
-		draw.Src)
-}
-
-func emulatorColorToRGBA(c emulator.Color) color.Color {
+func emulatorColorToRGBA(c emulator.Color, isFg bool) color.RGBA {
 	if c == emulator.ColorDefault {
-		return color.Black
+		if isFg {
+			return color.RGBA{R: 220, G: 220, B: 220, A: 255}
+		}
+		return color.RGBA{R: 30, G: 30, B: 30, A: 255}
 	}
 	val := uint32(c)
-	r := uint8((val >> 16) & 0xFF)
-	g := uint8((val >> 8) & 0xFF)
-	b := uint8(val & 0xFF)
-	return color.RGBA{r, g, b, 255}
+	rv := uint8((val >> 16) & 0xFF)
+	gv := uint8((val >> 8) & 0xFF)
+	bv := uint8(val & 0xFF)
+	return color.RGBA{R: rv, G: gv, B: bv, A: 255}
+}
+
+func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
+	px := float64(x * r.cellW)
+	py := float64(y * r.cellH)
+
+	// Background
+	bg := emulatorColorToRGBA(snap.bg, false)
+	opts := &ebiten.DrawImageOptions{}
+	opts.GeoM.Scale(float64(r.cellW), float64(r.cellH))
+	opts.GeoM.Translate(px, py)
+	opts.ColorScale.ScaleWithColor(bg)
+	r.framebuffer.DrawImage(r.whitePixel, opts)
+
+	if snap.char == ' ' || r.face == nil {
+		return
+	}
+
+	// Foreground
+	fg := emulatorColorToRGBA(snap.fg, true)
+	glyph := r.getGlyph(snap.char)
+	
+	opts = &ebiten.DrawImageOptions{}
+	opts.GeoM.Translate(px, py)
+	opts.ColorScale.ScaleWithColor(fg)
+	r.framebuffer.DrawImage(glyph, opts)
+}
+
+func (r *GUIRenderer) redrawFromBuffer(x, y int) bool {
+	if y < 0 || x < 0 || y >= len(r.prevBuffer) || x >= len(r.prevBuffer[y]) {
+		return false
+	}
+	r.drawCellGPU(x, y, r.prevBuffer[y][x])
+	return true
+}
+
+func (r *GUIRenderer) drawCursorGPU(x, y int) {
+	if y < 0 || x < 0 || y >= len(r.prevBuffer) || x >= len(r.prevBuffer[y]) {
+		return
+	}
+
+	px := float64(x * r.cellW)
+	py := float64(y * r.cellH)
+
+	opts := &ebiten.DrawImageOptions{}
+	opts.GeoM.Scale(2, float64(r.cellH))
+	opts.GeoM.Translate(px, py)
+	r.framebuffer.DrawImage(r.whitePixel, opts)
 }
 
 func (r *GUIRenderer) RenderCh() <-chan struct{} {
@@ -337,6 +416,8 @@ func (r *GUIRenderer) RenderCh() <-chan struct{} {
 
 func (r *GUIRenderer) ShowAndRun(t *emulator.Terminal) {
 	r.term = t
+	ebiten.SetScreenClearedEveryFrame(false)
+	ebiten.SetRunnableOnUnfocused(true)
 	if err := ebiten.RunGame(r); err != nil {
 		log.Fatal(err)
 	}
@@ -355,6 +436,4 @@ func (r *GUIRenderer) SetRuneHandler(h func(rn rune)) {
 }
 
 func (r *GUIRenderer) Close() {
-	// Ebitengine doesn't have a direct Close() for the window like Fyne,
-	// but we can signal the shell or just let the process exit.
 }

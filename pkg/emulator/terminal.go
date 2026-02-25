@@ -32,6 +32,10 @@ type Terminal struct {
 	Grid   [][]Cell
 	Cursor Cursor
 
+	Scrollback    [][]Cell
+	MaxScrollback int
+	ViewOffset    int // Lines scrolled up from bottom.
+
 	// Current styling
 	CurrentFg   Color
 	CurrentBg   Color
@@ -39,6 +43,7 @@ type Terminal struct {
 
 	// Dirty tracking — DirtyRows[y] is true if any cell in row y changed.
 	DirtyRows []bool
+	PendingScroll int
 
 	mu sync.Mutex
 }
@@ -65,13 +70,15 @@ func NewTerminal(width, height int) *Terminal {
 	}
 
 	return &Terminal{
-		Width:     width,
-		Height:    height,
-		Grid:      grid,
-		Cursor:    Cursor{X: 0, Y: 0},
-		CurrentFg: ColorDefault,
-		CurrentBg: ColorDefault,
-		DirtyRows: dirtyRows,
+		Width:         width,
+		Height:        height,
+		Grid:          grid,
+		Cursor:        Cursor{X: 0, Y: 0},
+		Scrollback:    make([][]Cell, 0, 5000),
+		MaxScrollback: 5000,
+		CurrentFg:     ColorDefault,
+		CurrentBg:     ColorDefault,
+		DirtyRows:     dirtyRows,
 	}
 }
 
@@ -80,10 +87,11 @@ func (t *Terminal) ClearDirty() {
 	for i := range t.DirtyRows {
 		t.DirtyRows[i] = false
 	}
-	for y := range t.Grid {
-		for x := range t.Grid[y] {
-			t.Grid[y][x].Modified = false
-		}
+}
+
+func (t *Terminal) markAllDirty() {
+	for i := range t.DirtyRows {
+		t.DirtyRows[i] = true
 	}
 }
 
@@ -156,15 +164,26 @@ func (t *Terminal) putChar(r rune) {
 
 // scrollUp scrolls the terminal grid up by one line.
 func (t *Terminal) scrollUp() {
+	if t.Height > 0 && len(t.Grid) > 0 {
+		line := make([]Cell, len(t.Grid[0]))
+		copy(line, t.Grid[0])
+		t.Scrollback = append(t.Scrollback, line)
+		if len(t.Scrollback) > t.MaxScrollback {
+			t.Scrollback = t.Scrollback[len(t.Scrollback)-t.MaxScrollback:]
+		}
+		if t.ViewOffset > 0 && t.ViewOffset < len(t.Scrollback) {
+			t.ViewOffset++
+		}
+	}
+
 	copy(t.Grid[0:], t.Grid[1:])
+	copy(t.DirtyRows[0:], t.DirtyRows[1:])
 	t.Grid[t.Height-1] = make([]Cell, t.Width)
 	for j := range t.Grid[t.Height-1] {
-		t.Grid[t.Height-1][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault}
+		t.Grid[t.Height-1][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
 	}
-	// All rows are dirty after a scroll
-	for i := range t.DirtyRows {
-		t.DirtyRows[i] = true
-	}
+	t.DirtyRows[t.Height-1] = true
+	t.PendingScroll++
 }
 
 // Clear clears the terminal grid.
@@ -182,6 +201,7 @@ func (t *Terminal) clear() {
 		t.DirtyRows[i] = true
 	}
 	t.Cursor = Cursor{X: 0, Y: 0}
+	t.ViewOffset = 0
 }
 
 // EraseInLine erases parts of the current line.
@@ -380,6 +400,113 @@ func (t *Terminal) Resize(width, height int) {
 	if t.Cursor.Y >= height {
 		t.Cursor.Y = height - 1
 	}
+	if t.ViewOffset > len(t.Scrollback) {
+		t.ViewOffset = len(t.Scrollback)
+	}
+}
+
+func (t *Terminal) maxViewOffsetLocked() int {
+	if len(t.Scrollback) == 0 {
+		return 0
+	}
+	return len(t.Scrollback)
+}
+
+func (t *Terminal) ScrollUpLines(lines int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if lines <= 0 {
+		return
+	}
+	t.ViewOffset += lines
+	max := t.maxViewOffsetLocked()
+	if t.ViewOffset > max {
+		t.ViewOffset = max
+	}
+	t.markAllDirty()
+}
+
+func (t *Terminal) ScrollDownLines(lines int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if lines <= 0 {
+		return
+	}
+	t.ViewOffset -= lines
+	if t.ViewOffset < 0 {
+		t.ViewOffset = 0
+	}
+	t.markAllDirty()
+}
+
+func (t *Terminal) ScrollPageUp() {
+	step := t.Height - 1
+	if step < 1 {
+		step = 1
+	}
+	t.ScrollUpLines(step)
+}
+
+func (t *Terminal) ScrollPageDown() {
+	step := t.Height - 1
+	if step < 1 {
+		step = 1
+	}
+	t.ScrollDownLines(step)
+}
+
+func (t *Terminal) ScrollToBottom() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.ViewOffset == 0 {
+		return
+	}
+	t.ViewOffset = 0
+	t.markAllDirty()
+}
+
+// ViewRow returns the visible row at y in the current viewport.
+// Caller must hold t lock.
+func (t *Terminal) ViewRow(y int) []Cell {
+	total := len(t.Scrollback) + t.Height
+	if y < 0 || y >= t.Height || total == 0 {
+		return nil
+	}
+	start := total - t.Height - t.ViewOffset
+	if start < 0 {
+		start = 0
+	}
+	idx := start + y
+	if idx < 0 || idx >= total {
+		return nil
+	}
+	if idx < len(t.Scrollback) {
+		return t.Scrollback[idx]
+	}
+	gridY := idx - len(t.Scrollback)
+	if gridY < 0 || gridY >= len(t.Grid) {
+		return nil
+	}
+	return t.Grid[gridY]
+}
+
+// CursorViewPosition returns cursor coordinates in the current viewport.
+// Caller must hold t lock.
+func (t *Terminal) CursorViewPosition() (x int, y int, ok bool) {
+	total := len(t.Scrollback) + t.Height
+	if total == 0 {
+		return 0, 0, false
+	}
+	start := total - t.Height - t.ViewOffset
+	if start < 0 {
+		start = 0
+	}
+	abs := len(t.Scrollback) + t.Cursor.Y
+	viewY := abs - start
+	if viewY < 0 || viewY >= t.Height {
+		return 0, 0, false
+	}
+	return t.Cursor.X, viewY, true
 }
 
 // Lock locks the terminal for reading/writing.

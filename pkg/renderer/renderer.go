@@ -28,7 +28,6 @@ func NewTUIRenderer() (*TUIRenderer, error) {
 	s.SetStyle(tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite))
 	s.Clear()
 
-
 	return &TUIRenderer{screen: s}, nil
 }
 
@@ -37,17 +36,33 @@ func (r *TUIRenderer) Render(t *emulator.Terminal) {
 	t.Lock()
 	defer t.Unlock()
 
-	r.screen.Clear()
-	for y, row := range t.Grid {
-		for x, cell := range row {
-			st := tcell.StyleDefault
-			r.screen.SetContent(x, y, cell.Char, nil, st)
+	for y := 0; y < len(t.DirtyRows); y++ {
+		if !t.DirtyRows[y] {
+			continue
 		}
+		row := t.ViewRow(y)
+		for x, cell := range t.Grid[y] {
+			if row != nil && x < len(row) {
+				cell = row[x]
+			} else {
+				cell = emulator.Cell{Char: ' ', FgColor: emulator.ColorDefault, BgColor: emulator.ColorDefault}
+			}
+			char := cell.Char
+			if char == 0 || cell.WideCont {
+				char = ' '
+			}
+			r.screen.SetContent(x, y, char, nil, tcell.StyleDefault)
+		}
+		t.DirtyRows[y] = false
 	}
-	r.screen.ShowCursor(t.Cursor.X, t.Cursor.Y)
+
+	if cx, cy, ok := t.CursorViewPosition(); ok {
+		r.screen.ShowCursor(cx, cy)
+	} else {
+		r.screen.HideCursor()
+	}
 	r.screen.Show()
 }
-
 
 // Close closes the screen.
 func (r *TUIRenderer) Close() {

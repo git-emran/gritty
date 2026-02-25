@@ -63,37 +63,61 @@ func main() {
 
 	// Bridge GUI keys to PTY
 	rend.SetKeyHandler(func(key ebiten.Key) {
+		shiftPressed := ebiten.IsKeyPressed(ebiten.KeyShiftLeft) || ebiten.IsKeyPressed(ebiten.KeyShiftRight)
+		send := func(data []byte) {
+			term.ScrollToBottom()
+			manager.Write(data)
+		}
+
 		switch key {
 		case ebiten.KeyEnter, ebiten.KeyNumpadEnter:
-			manager.Write([]byte{'\r'})
+			send([]byte{'\r'})
 		case ebiten.KeyBackspace:
-			manager.Write([]byte{0x7f})
+			send([]byte{0x7f})
 		case ebiten.KeyTab:
-			manager.Write([]byte{'\t'})
+			send([]byte{'\t'})
 		case ebiten.KeyUp:
-			manager.Write([]byte("\x1b[A"))
+			if shiftPressed {
+				term.ScrollUpLines(1)
+				return
+			}
+			send([]byte("\x1b[A"))
 		case ebiten.KeyDown:
-			manager.Write([]byte("\x1b[B"))
+			if shiftPressed {
+				term.ScrollDownLines(1)
+				return
+			}
+			send([]byte("\x1b[B"))
 		case ebiten.KeyRight:
-			manager.Write([]byte("\x1b[C"))
+			send([]byte("\x1b[C"))
 		case ebiten.KeyLeft:
-			manager.Write([]byte("\x1b[D"))
+			send([]byte("\x1b[D"))
 		case ebiten.KeyHome:
-			manager.Write([]byte("\x1b[H"))
+			send([]byte("\x1b[H"))
 		case ebiten.KeyEnd:
-			manager.Write([]byte("\x1b[F"))
+			send([]byte("\x1b[F"))
 		case ebiten.KeyPageUp:
-			manager.Write([]byte("\x1b[5~"))
+			if shiftPressed {
+				term.ScrollPageUp()
+				return
+			}
+			send([]byte("\x1b[5~"))
 		case ebiten.KeyPageDown:
-			manager.Write([]byte("\x1b[6~"))
+			if shiftPressed {
+				term.ScrollPageDown()
+				return
+			}
+			send([]byte("\x1b[6~"))
 		case ebiten.KeyDelete:
-			manager.Write([]byte("\x1b[3~"))
+			send([]byte("\x1b[3~"))
 		case ebiten.KeyEscape:
+			term.ScrollToBottom()
 			manager.Write([]byte{0x1b})
 		}
 	})
 
 	rend.SetRuneHandler(func(rn rune) {
+		term.ScrollToBottom()
 		manager.Write([]byte(string(rn)))
 	})
 

@@ -292,6 +292,7 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 				switch p2 {
 				case "1049": // Alt screen — clear for now
 					p.terminal.clear()
+					p.terminal.UseAltScreen = true
 				case "25": // Show cursor — ignore
 				}
 			}
@@ -302,6 +303,7 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 				switch p2 {
 				case "1049": // Leave alt screen
 					p.terminal.clear()
+					p.terminal.UseAltScreen = false
 				case "25": // Hide cursor — ignore
 				}
 			}

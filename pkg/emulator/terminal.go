@@ -1,7 +1,6 @@
 package emulator
 
 import (
-	"log"
 	"sync"
 
 	"github.com/mattn/go-runewidth"
@@ -46,6 +45,7 @@ type Terminal struct {
 	DirtyRows     []bool
 	PendingScroll int
 	ForceRedraw   bool
+	UseAltScreen  bool
 
 	mu sync.Mutex
 }
@@ -453,7 +453,6 @@ func (t *Terminal) ScrollUpLines(lines int) {
 	}
 	t.ViewOffset += lines
 	max := t.maxViewOffsetLocked()
-	log.Printf("ScrollUpLines: lines=%d, viewOffset=%d, max=%d\n", lines, t.ViewOffset, max)
 	if t.ViewOffset > max {
 		t.ViewOffset = max
 	}
@@ -467,7 +466,6 @@ func (t *Terminal) ScrollDownLines(lines int) {
 		return
 	}
 	t.ViewOffset -= lines
-	log.Printf("ScrollDownLines: lines=%d, viewOffset=%d\n", lines, t.ViewOffset)
 	if t.ViewOffset < 0 {
 		t.ViewOffset = 0
 	}
@@ -497,6 +495,13 @@ func (t *Terminal) ScrollToBottom() {
 		return
 	}
 	t.ViewOffset = 0
+	t.ForceRedraw = true
+}
+
+// RequestFullRedraw marks the full viewport dirty for renderer updates.
+func (t *Terminal) RequestFullRedraw() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.ForceRedraw = true
 }
 

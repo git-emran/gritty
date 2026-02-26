@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,7 +30,8 @@ type GUIRenderer struct {
 	cellW int
 	cellH int
 
-	face font.Face
+	face          font.Face
+	glyphBaseline int
 
 	prevBuffer [][]cellSnapshot
 
@@ -37,6 +39,9 @@ type GUIRenderer struct {
 	lastCursorVisible bool
 	prevCursorX       int
 	prevCursorY       int
+	isDarkMode        bool
+	theme             terminalTheme
+	lastThemeCheck    time.Time
 
 	renderCh chan struct{}
 
@@ -57,7 +62,7 @@ type cellSnapshot struct {
 	bg   emulator.Color
 }
 
-func loadNerdFontFace(size float64) font.Face {
+func loadNerdFontFace(size float64, dpi float64) font.Face {
 	candidates := []string{
 		"JetBrainsMonoNerdFontMono-Regular.ttf",
 		"FiraCodeNerdFontMono-Regular.ttf",
@@ -82,11 +87,11 @@ func loadNerdFontFace(size float64) font.Face {
 			}
 			face, err := opentype.NewFace(ft, &opentype.FaceOptions{
 				Size:    size,
-				DPI:     72,
+				DPI:     dpi,
 				Hinting: font.HintingFull,
 			})
 			if err == nil {
-				log.Println("Loaded font:", path)
+				log.Printf("Loaded font: %s (DPI: %.1f)", path, dpi)
 				return face
 			}
 		}
@@ -95,9 +100,27 @@ func loadNerdFontFace(size float64) font.Face {
 	return nil
 }
 
+func measureCell(face font.Face) (cellW, cellH, baseline int) {
+	if face == nil {
+		return 10, 20, 15
+	}
+
+	metrics := face.Metrics()
+	ascent := metrics.Ascent.Ceil()
+	descent := metrics.Descent.Ceil()
+	lineGap := 0
+	cellH = ascent + descent + lineGap
+
+	advance := font.MeasureString(face, "M").Ceil()
+	cellW = advance
+	baseline = ascent
+	return cellW, cellH, baseline
+}
+
 func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
-	cellW := 9
-	cellH := 18
+	scale := ebiten.DeviceScaleFactor()
+	face := loadNerdFontFace(12, 96*scale)
+	cellW, cellH, baseline := measureCell(face)
 
 	fb := ebiten.NewImage(cols*cellW, rows*cellH)
 	bb := ebiten.NewImage(cols*cellW, rows*cellH)
@@ -105,6 +128,7 @@ func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 	wp := ebiten.NewImage(1, 1)
 	wp.Fill(color.White)
 
+	isDark := detectDarkMode()
 	r := &GUIRenderer{
 		framebuffer:       fb,
 		backbuffer:        bb,
@@ -114,12 +138,16 @@ func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 		height:            rows,
 		cellW:             cellW,
 		cellH:             cellH,
-		face:              loadNerdFontFace(14),
+		face:              face,
+		glyphBaseline:     baseline,
 		renderCh:          make(chan struct{}, 1),
 		cursorVisible:     true,
 		lastCursorVisible: true,
 		prevCursorX:       -1,
 		prevCursorY:       -1,
+		isDarkMode:        isDark,
+		theme:             activeTheme(isDark),
+		lastThemeCheck:    time.Now(),
 	}
 
 	r.prevBuffer = make([][]cellSnapshot, rows)
@@ -131,6 +159,10 @@ func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 
 	ebiten.SetWindowTitle(title)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+	ebiten.SetScreenFilterEnabled(false)
+	ebiten.SetWindowSize(int(float64(cols*cellW)/scale), int(float64(rows*cellH)/scale))
+	// Window limits in logical pixels
+	ebiten.SetWindowSizeLimits(400, 300, -1, -1)
 
 	return r, nil
 }
@@ -150,10 +182,17 @@ func (r *GUIRenderer) cursorBlink() {
 }
 
 func (r *GUIRenderer) Update() error {
+	// Poll system appearance periodically so light/dark changes apply at runtime.
+	if time.Since(r.lastThemeCheck) >= 2*time.Second {
+		r.lastThemeCheck = time.Now()
+		if isDark := detectDarkMode(); isDark != r.isDarkMode {
+			r.applyTheme(isDark)
+		}
+	}
+
 	if r.wheelHandler != nil {
 		dx, dy := ebiten.Wheel()
 		if dx != 0 || dy != 0 {
-			log.Printf("Wheel Event: dx=%f, dy=%f\n", dx, dy)
 			r.wheelHandler(dx, dy)
 		}
 	}
@@ -181,14 +220,23 @@ func (r *GUIRenderer) Update() error {
 		}
 	}
 
-	// Resize handling
+	// Dynamic scaling and resize handling
+	scale := ebiten.DeviceScaleFactor()
 	w, h := ebiten.WindowSize()
-	newCols := w / r.cellW
-	newRows := h / r.cellH
+	// logical width * scale = physical width
+	pW := int(float64(w) * scale)
+	pH := int(float64(h) * scale)
+
+	newCols := pW / r.cellW
+	newRows := pH / r.cellH
+
 	if newCols != r.width || newRows != r.height {
 		if newCols > 0 && newRows > 0 {
 			r.width = newCols
 			r.height = newRows
+
+			// Re-measure if scale changed significantly
+			// (Ebitengine scale factor might change when moving between monitors)
 			r.framebuffer = ebiten.NewImage(r.width*r.cellW, r.height*r.cellH)
 			r.backbuffer = ebiten.NewImage(r.width*r.cellW, r.height*r.cellH)
 
@@ -215,14 +263,29 @@ func (r *GUIRenderer) Draw(screen *ebiten.Image) {
 
 	r.renderTerm(r.term)
 
-	bg := emulatorColorToRGBA(emulator.ColorDefault, false)
+	bg := r.resolveColor(emulator.ColorDefault, false)
 	screen.Fill(bg)
 
-	screen.DrawImage(r.framebuffer, nil)
+	// Center the framebuffer to avoid uneven empty space (slack) on resize
+	w, h := ebiten.WindowSize()
+	scale := ebiten.DeviceScaleFactor()
+	pW := int(float64(w) * scale)
+	pH := int(float64(h) * scale)
+
+	fbW := r.width * r.cellW
+	fbH := r.height * r.cellH
+
+	opts := &ebiten.DrawImageOptions{}
+	offsetX := float64(pW-fbW) / 2.0
+	offsetY := float64(pH-fbH) / 2.0
+	opts.GeoM.Translate(offsetX, offsetY)
+
+	screen.DrawImage(r.framebuffer, opts)
 }
 
 func (r *GUIRenderer) Layout(outsideWidth, outsideHeight int) (int, int) {
-	return outsideWidth, outsideHeight
+	s := ebiten.DeviceScaleFactor()
+	return int(float64(outsideWidth) * s), int(float64(outsideHeight) * s)
 }
 
 func (r *GUIRenderer) getGlyph(char rune) *ebiten.Image {
@@ -238,7 +301,7 @@ func (r *GUIRenderer) getGlyph(char rune) *ebiten.Image {
 			Src:  image.NewUniform(color.White),
 			Face: r.face,
 		}
-		d.Dot = fixed.P(0, r.cellH-4)
+		d.Dot = fixed.P(0, r.glyphBaseline)
 		d.DrawString(string(char))
 	}
 
@@ -382,26 +445,12 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 	return changed
 }
 
-func emulatorColorToRGBA(c emulator.Color, isFg bool) color.RGBA {
-	if c == emulator.ColorDefault {
-		if isFg {
-			return color.RGBA{R: 220, G: 220, B: 220, A: 255}
-		}
-		return color.RGBA{R: 30, G: 30, B: 30, A: 255}
-	}
-	val := uint32(c)
-	rv := uint8((val >> 16) & 0xFF)
-	gv := uint8((val >> 8) & 0xFF)
-	bv := uint8(val & 0xFF)
-	return color.RGBA{R: rv, G: gv, B: bv, A: 255}
-}
-
 func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
 	px := float64(x * r.cellW)
 	py := float64(y * r.cellH)
 
 	// Background
-	bg := emulatorColorToRGBA(snap.bg, false)
+	bg := r.resolveColor(snap.bg, false)
 	opts := &ebiten.DrawImageOptions{}
 	opts.GeoM.Scale(float64(r.cellW), float64(r.cellH))
 	opts.GeoM.Translate(px, py)
@@ -414,9 +463,10 @@ func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
 	}
 
 	// Foreground
-	fg := emulatorColorToRGBA(snap.fg, true)
+	fg := r.resolveColor(snap.fg, true)
+	fg = r.ensureReadableForeground(fg, bg)
 	glyph := r.getGlyph(snap.char)
-	
+
 	opts = &ebiten.DrawImageOptions{}
 	opts.GeoM.Translate(px, py)
 	opts.ColorScale.ScaleWithColor(fg)
@@ -442,7 +492,107 @@ func (r *GUIRenderer) drawCursorGPU(x, y int) {
 	opts := &ebiten.DrawImageOptions{}
 	opts.GeoM.Scale(2, float64(r.cellH))
 	opts.GeoM.Translate(px, py)
+	opts.ColorScale.Scale(float32(r.theme.cursor[0])/255.0, float32(r.theme.cursor[1])/255.0, float32(r.theme.cursor[2])/255.0, 1)
 	r.framebuffer.DrawImage(r.whitePixel, opts)
+}
+
+func (r *GUIRenderer) applyTheme(isDark bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.isDarkMode = isDark
+	r.theme = activeTheme(isDark)
+	r.glyphCache = make(map[rune]*ebiten.Image) // Clear cache for new colors
+	if r.term != nil {
+		r.term.RequestFullRedraw()
+	}
+}
+
+func (r *GUIRenderer) resolveColor(c emulator.Color, isFg bool) color.RGBA {
+	if c == emulator.ColorDefault {
+		if isFg {
+			return color.RGBA{R: r.theme.foreground[0], G: r.theme.foreground[1], B: r.theme.foreground[2], A: 255}
+		}
+		return color.RGBA{R: r.theme.background[0], G: r.theme.background[1], B: r.theme.background[2], A: 255}
+	}
+
+	val := uint32(c)
+	hi := uint8(val >> 24)
+	if hi == 0x01 {
+		return color.RGBA{
+			R: uint8((val >> 16) & 0xFF),
+			G: uint8((val >> 8) & 0xFF),
+			B: uint8(val & 0xFF),
+			A: 255,
+		}
+	}
+
+	if val <= 255 {
+		return r.ansi256Color(uint8(val))
+	}
+
+	return color.RGBA{
+		R: uint8((val >> 16) & 0xFF),
+		G: uint8((val >> 8) & 0xFF),
+		B: uint8(val & 0xFF),
+		A: 255,
+	}
+}
+
+func (r *GUIRenderer) ansi256Color(idx uint8) color.RGBA {
+	if idx < 16 {
+		rgb := r.theme.ansi16[idx]
+		return color.RGBA{R: rgb[0], G: rgb[1], B: rgb[2], A: 255}
+	}
+
+	if idx >= 16 && idx <= 231 {
+		i := int(idx - 16)
+		r := i / 36
+		g := (i % 36) / 6
+		b := i % 6
+		scale := [6]uint8{0, 95, 135, 175, 215, 255}
+		return color.RGBA{R: scale[r], G: scale[g], B: scale[b], A: 255}
+	}
+
+	gray := uint8(8 + (idx-232)*10)
+	return color.RGBA{R: gray, G: gray, B: gray, A: 255}
+}
+
+func srgbToLinear(c uint8) float64 {
+	v := float64(c) / 255.0
+	if v <= 0.04045 {
+		return v / 12.92
+	}
+	return math.Pow((v+0.055)/1.055, 2.4)
+}
+
+func relativeLuminance(c color.RGBA) float64 {
+	r := srgbToLinear(c.R)
+	g := srgbToLinear(c.G)
+	b := srgbToLinear(c.B)
+	return 0.2126*r + 0.7152*g + 0.0722*b
+}
+
+func contrastRatio(a, b color.RGBA) float64 {
+	la := relativeLuminance(a)
+	lb := relativeLuminance(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
+}
+
+func (r *GUIRenderer) ensureReadableForeground(fg, bg color.RGBA) color.RGBA {
+	// Guard against unreadable color pairs (e.g. black-on-black from ANSI apps).
+	if contrastRatio(fg, bg) >= 3.0 {
+		return fg
+	}
+	return color.RGBA{
+		R: r.theme.foreground[0],
+		G: r.theme.foreground[1],
+		B: r.theme.foreground[2],
+		A: 255,
+	}
 }
 
 func (r *GUIRenderer) RenderCh() <-chan struct{} {

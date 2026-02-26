@@ -2,6 +2,8 @@
 
 Gritty is a high-performance terminal emulator built in Go, designed for speed and visual excellence. It leverages the [Ebitengine](https://ebitengine.org/) game engine for GPU-accelerated rendering and features a custom-built terminal emulator and PTY manager.
 
+![Gritty](https://github.com/user-attachments/assets/dae15339-65bb-49f6-8e0f-975287b9c9ac)
+
 ## Features
 
 - **Blazing Fast Rendering**: Custom raster-based renderer with dirty-region tracking to minimize CPU usage.
@@ -84,3 +86,4 @@ Gritty is an open-source project. We welcome contributions in the form of bug re
 ## License
 
 [MIT License](LICENSE) (or whatever license you prefer)
+

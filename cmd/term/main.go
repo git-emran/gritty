@@ -123,15 +123,31 @@ func main() {
 
 	var scrollAccum float64
 	rend.SetWheelHandler(func(dx, dy float64) {
+		term.Lock()
+		isAlt := term.UseAltScreen
+		term.Unlock()
+
 		scrollAccum += dy
 		if scrollAccum >= 1.0 {
 			lines := int(scrollAccum)
 			scrollAccum -= float64(lines)
-			term.ScrollUpLines(lines)
+			if isAlt {
+				for i := 0; i < lines; i++ {
+					manager.Write([]byte("\x1b[A")) // Arrow Up
+				}
+			} else {
+				term.ScrollUpLines(lines)
+			}
 		} else if scrollAccum <= -1.0 {
 			lines := int(-scrollAccum)
 			scrollAccum += float64(lines)
-			term.ScrollDownLines(lines)
+			if isAlt {
+				for i := 0; i < lines; i++ {
+					manager.Write([]byte("\x1b[B")) // Arrow Down
+				}
+			} else {
+				term.ScrollDownLines(lines)
+			}
 		}
 	})
 

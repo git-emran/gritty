@@ -40,9 +40,9 @@ graph TD
 
 - **Go**: Version 1.25 or later.
 - **Dependencies**:
-    - `ebitengine/v2`
-    - `creack/pty`
-    - `golang.org/x/image`
+  - `ebitengine/v2`
+  - `creack/pty`
+  - `golang.org/x/image`
 
 ### Running for Development
 
@@ -60,7 +60,7 @@ make build
 
 ### Packaging for macOS
 
-To create a native `Gritty.app` (requires the [Fyne CLI](https://developer.fyne.io/started/)):
+To create a native `Gritty.app` requires Ebitengine
 
 ```bash
 make build-mac
@@ -86,4 +86,3 @@ Gritty is an open-source project. We welcome contributions in the form of bug re
 ## License
 
 [MIT License](LICENSE) (or whatever license you prefer)
-

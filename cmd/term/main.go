@@ -23,7 +23,7 @@ func main() {
 	width, height := 80, 24
 
 	// Initialize GUI Renderer
-	rend, err := renderer.NewGUIRenderer("Gritty Terminal", width, height)
+	rend, err := renderer.NewGUIRenderer("Gritty", width, height)
 	if err != nil {
 		log.Fatalf("failed to create renderer: %v", err)
 	}

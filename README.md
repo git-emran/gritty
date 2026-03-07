@@ -177,4 +177,5 @@ Contributions should preserve the existing separation between orchestration, ter
 
 ## License
 
-[MIT License](LICENSE) (or whatever license you prefer)
+Feel Free to use but Attribution required.
+

@@ -64,6 +64,8 @@ func main() {
 	// Bridge GUI keys to PTY
 	rend.SetKeyHandler(func(key ebiten.Key) {
 		shiftPressed := ebiten.IsKeyPressed(ebiten.KeyShiftLeft) || ebiten.IsKeyPressed(ebiten.KeyShiftRight)
+		scrollbackActive := term.IsViewingScrollback()
+		altScreenActive := term.IsAltScreenActive()
 		send := func(data []byte) {
 			term.ScrollToBottom()
 			manager.Write(data)
@@ -77,13 +79,13 @@ func main() {
 		case ebiten.KeyTab:
 			send([]byte{'\t'})
 		case ebiten.KeyUp:
-			if shiftPressed {
+			if !altScreenActive && (shiftPressed || scrollbackActive) {
 				term.ScrollUpLines(1)
 				return
 			}
 			send([]byte("\x1b[A"))
 		case ebiten.KeyDown:
-			if shiftPressed {
+			if !altScreenActive && (shiftPressed || scrollbackActive) {
 				term.ScrollDownLines(1)
 				return
 			}
@@ -93,17 +95,25 @@ func main() {
 		case ebiten.KeyLeft:
 			send([]byte("\x1b[D"))
 		case ebiten.KeyHome:
+			if !altScreenActive && scrollbackActive {
+				term.ScrollToTop()
+				return
+			}
 			send([]byte("\x1b[H"))
 		case ebiten.KeyEnd:
+			if !altScreenActive && scrollbackActive {
+				term.ScrollToBottom()
+				return
+			}
 			send([]byte("\x1b[F"))
 		case ebiten.KeyPageUp:
-			if shiftPressed {
+			if !altScreenActive {
 				term.ScrollPageUp()
 				return
 			}
 			send([]byte("\x1b[5~"))
 		case ebiten.KeyPageDown:
-			if shiftPressed {
+			if !altScreenActive {
 				term.ScrollPageDown()
 				return
 			}
@@ -123,9 +133,7 @@ func main() {
 
 	var scrollAccum float64
 	rend.SetWheelHandler(func(dx, dy float64) {
-		term.Lock()
-		isAlt := term.UseAltScreen
-		term.Unlock()
+		isAlt := term.IsAltScreenActive()
 
 		scrollAccum += dy
 		if scrollAccum >= 1.0 {

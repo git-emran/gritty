@@ -72,7 +72,9 @@ Gritty includes a Python-based verification script to test terminal capabilities
 
 ```bash
 python3 verify_terminal.py
+
 ```
+
 
 ## Troubleshooting
 

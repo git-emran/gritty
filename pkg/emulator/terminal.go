@@ -498,6 +498,29 @@ func (t *Terminal) ScrollToBottom() {
 	t.ForceRedraw = true
 }
 
+func (t *Terminal) ScrollToTop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	max := t.maxViewOffsetLocked()
+	if t.ViewOffset == max {
+		return
+	}
+	t.ViewOffset = max
+	t.ForceRedraw = true
+}
+
+func (t *Terminal) IsViewingScrollback() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ViewOffset > 0
+}
+
+func (t *Terminal) IsAltScreenActive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.UseAltScreen
+}
+
 // RequestFullRedraw marks the full viewport dirty for renderer updates.
 func (t *Terminal) RequestFullRedraw() {
 	t.mu.Lock()

@@ -53,7 +53,47 @@ def print_icon_test():
         print(f"{e}  ", end="")
     print("\n")
 
+def print_style_test():
+    print("--- Styles (Italic / Underline) ---")
+    print("normal  " + "\033[3mitalic\033[0m  " + "\033[4munderline\033[0m  " + "\033[1mbold\033[0m")
+    print()
+
+def print_scroll_region_test():
+    print("--- Scrolling Region (DECSTBM) ---")
+    # Draw a boxed region and then scroll inside it.
+    # Region: rows 3..8 (1-based)
+    print("line 1 (outside)")
+    print("line 2 (outside)")
+    print("\033[3;8r", end="")   # set scroll region
+    print("\033[3;1H", end="")   # go to top of region
+    for i in range(1, 12):
+        print(f"region line {i:02d}")
+    print("\033[r", end="")      # reset scroll region to full
+    print("\nline 9 (outside)")
+    print("line 10 (outside)")
+    print()
+
+def print_alt_screen_test():
+    print("--- Alternate Screen (?1049) ---")
+    print("Switching to alt screen for a moment...")
+    print("\033[?1049h", end="")  # enter alt screen
+    print("\033[2J\033[H", end="")
+    print("ALT SCREEN: if you see this, alt-screen works.")
+    print("Returning to main screen in 1s...")
+    sys.stdout.flush()
+    try:
+        import time
+        time.sleep(1)
+    except Exception:
+        pass
+    print("\033[?1049l", end="")  # exit alt screen
+    print("Back on main screen.")
+    print()
+
 if __name__ == "__main__":
     print_color_test()
+    print_style_test()
+    print_scroll_region_test()
+    print_alt_screen_test()
     print_icon_test()
     print("Verification complete!")

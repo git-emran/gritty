@@ -10,7 +10,8 @@ Gritty is a high-performance terminal emulator built in Go, designed for speed a
 - **GPU-Accelerated Glyph Cache**: Efficient rendering of text using a dynamic glyph cache.
 - **Nerd Font Support**: Full support for Nerd Fonts and modern typography.
 - **Adaptive Theming**: Automatically detects system dark mode and adjusts themes accordingly.
-- **Smooth Scrolling**: Optimized scroll performance with alternate screen handling (e.g., for `vim`, `less`).
+- **Neovim-Friendly VT Support**: Scroll regions (DECSTBM), alternate-screen buffer restore, italic/underline rendering, and Ctrl/F-key input mapping for TUIs.
+- **Smooth Scrolling**: Optimized scroll performance with alternate-screen handling (e.g., for `vim`, `less`).
 - **macOS Integration**: Easily packageable as a native `.app` bundle.
 
 ## Architecture
@@ -102,6 +103,8 @@ Gritty includes a Python-based verification script to test terminal capabilities
 python3 verify_terminal.py
 
 ```
+
+The verification script also exercises TUI-critical sequences used heavily by Neovim, including scroll regions, alternate screen, and text styling.
 
 
 ## Troubleshooting

@@ -21,7 +21,7 @@ import (
 type GUIRenderer struct {
 	framebuffer *ebiten.Image
 	backbuffer  *ebiten.Image
-	glyphCache  map[rune]*ebiten.Image
+	glyphCache  map[glyphKey]*ebiten.Image
 	whitePixel  *ebiten.Image
 
 	width  int
@@ -33,8 +33,11 @@ type GUIRenderer struct {
 	viewportPadX int
 	viewportPadY int
 
-	face          font.Face
-	glyphBaseline int
+	faceRegular    font.Face
+	faceBold       font.Face
+	faceItalic     font.Face
+	faceBoldItalic font.Face
+	glyphBaseline  int
 
 	prevBuffer [][]cellSnapshot
 
@@ -60,10 +63,17 @@ type GUIRenderer struct {
 }
 
 type cellSnapshot struct {
-	char rune
-	fg   emulator.Color
-	bg   emulator.Color
-	bold bool
+	char      rune
+	fg        emulator.Color
+	bg        emulator.Color
+	bold      bool
+	italic    bool
+	underline bool
+}
+
+type glyphKey struct {
+	char  rune
+	style uint8
 }
 
 func maxInt(a, b int) int {
@@ -73,18 +83,14 @@ func maxInt(a, b int) int {
 	return b
 }
 
-func loadNerdFontFace(size float64, dpi float64) font.Face {
-	candidates := []string{
-		"JetBrainsMonoNerdFontMono-Regular.ttf",
-		"FiraCodeNerdFontMono-Regular.ttf",
-		"HackNerdFontMono-Regular.ttf",
-	}
+type fontFaces struct {
+	regular    font.Face
+	bold       font.Face
+	italic     font.Face
+	boldItalic font.Face
+}
 
-	searchDirs := []string{
-		filepath.Join(os.Getenv("HOME"), "Library", "Fonts"),
-		"/Library/Fonts",
-	}
-
+func loadFontFace(searchDirs []string, candidates []string, size float64, dpi float64) font.Face {
 	for _, dir := range searchDirs {
 		for _, name := range candidates {
 			path := filepath.Join(dir, name)
@@ -107,8 +113,40 @@ func loadNerdFontFace(size float64, dpi float64) font.Face {
 			}
 		}
 	}
-
 	return nil
+}
+
+func loadNerdFontFaces(size float64, dpi float64) fontFaces {
+	searchDirs := []string{
+		filepath.Join(os.Getenv("HOME"), "Library", "Fonts"),
+		"/Library/Fonts",
+	}
+
+	regular := loadFontFace(searchDirs, []string{
+		"JetBrainsMonoNerdFontMono-Regular.ttf",
+		"FiraCodeNerdFontMono-Regular.ttf",
+		"HackNerdFontMono-Regular.ttf",
+	}, size, dpi)
+
+	bold := loadFontFace(searchDirs, []string{
+		"JetBrainsMonoNerdFontMono-Bold.ttf",
+		"FiraCodeNerdFontMono-Bold.ttf",
+		"HackNerdFontMono-Bold.ttf",
+	}, size, dpi)
+
+	italic := loadFontFace(searchDirs, []string{
+		"JetBrainsMonoNerdFontMono-Italic.ttf",
+		"FiraCodeNerdFontMono-Italic.ttf",
+		"HackNerdFontMono-Italic.ttf",
+	}, size, dpi)
+
+	boldItalic := loadFontFace(searchDirs, []string{
+		"JetBrainsMonoNerdFontMono-BoldItalic.ttf",
+		"FiraCodeNerdFontMono-BoldItalic.ttf",
+		"HackNerdFontMono-BoldItalic.ttf",
+	}, size, dpi)
+
+	return fontFaces{regular: regular, bold: bold, italic: italic, boldItalic: boldItalic}
 }
 
 func measureCell(face font.Face) (cellW, cellH, baseline int) {
@@ -130,8 +168,8 @@ func measureCell(face font.Face) (cellW, cellH, baseline int) {
 
 func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 	scale := ebiten.DeviceScaleFactor()
-	face := loadNerdFontFace(12, 96*scale)
-	cellW, cellH, baseline := measureCell(face)
+	faces := loadNerdFontFaces(12, 96*scale)
+	cellW, cellH, baseline := measureCell(faces.regular)
 	padX := maxInt(cellW, 12)
 	padY := maxInt(cellH/2, 12)
 
@@ -145,7 +183,7 @@ func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 	r := &GUIRenderer{
 		framebuffer:       fb,
 		backbuffer:        bb,
-		glyphCache:        make(map[rune]*ebiten.Image),
+		glyphCache:        make(map[glyphKey]*ebiten.Image),
 		whitePixel:        wp,
 		width:             cols,
 		height:            rows,
@@ -153,7 +191,10 @@ func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 		cellH:             cellH,
 		viewportPadX:      padX,
 		viewportPadY:      padY,
-		face:              face,
+		faceRegular:       faces.regular,
+		faceBold:          faces.bold,
+		faceItalic:        faces.italic,
+		faceBoldItalic:    faces.boldItalic,
 		glyphBaseline:     baseline,
 		renderCh:          make(chan struct{}, 1),
 		cursorVisible:     true,
@@ -233,7 +274,20 @@ func (r *GUIRenderer) Update() error {
 			ebiten.KeyEnter, ebiten.KeyBackspace, ebiten.KeyTab,
 			ebiten.KeyUp, ebiten.KeyDown, ebiten.KeyLeft, ebiten.KeyRight,
 			ebiten.KeyHome, ebiten.KeyEnd, ebiten.KeyPageUp, ebiten.KeyPageDown,
-			ebiten.KeyDelete, ebiten.KeyEscape,
+			ebiten.KeyInsert, ebiten.KeyDelete, ebiten.KeyEscape,
+			ebiten.KeyF1, ebiten.KeyF2, ebiten.KeyF3, ebiten.KeyF4, ebiten.KeyF5, ebiten.KeyF6,
+			ebiten.KeyF7, ebiten.KeyF8, ebiten.KeyF9, ebiten.KeyF10, ebiten.KeyF11, ebiten.KeyF12,
+		}
+
+		ctrlPressed := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyControlLeft) || ebiten.IsKeyPressed(ebiten.KeyControlRight)
+		if ctrlPressed {
+			keys = append(keys,
+				ebiten.KeyA, ebiten.KeyB, ebiten.KeyC, ebiten.KeyD, ebiten.KeyE, ebiten.KeyF, ebiten.KeyG,
+				ebiten.KeyH, ebiten.KeyI, ebiten.KeyJ, ebiten.KeyK, ebiten.KeyL, ebiten.KeyM, ebiten.KeyN,
+				ebiten.KeyO, ebiten.KeyP, ebiten.KeyQ, ebiten.KeyR, ebiten.KeyS, ebiten.KeyT, ebiten.KeyU,
+				ebiten.KeyV, ebiten.KeyW, ebiten.KeyX, ebiten.KeyY, ebiten.KeyZ,
+				ebiten.KeySpace,
+			)
 		}
 
 		for _, k := range keys {
@@ -316,25 +370,43 @@ func (r *GUIRenderer) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return int(float64(outsideWidth) * s), int(float64(outsideHeight) * s)
 }
 
-func (r *GUIRenderer) getGlyph(char rune) *ebiten.Image {
-	if img, ok := r.glyphCache[char]; ok {
+func (r *GUIRenderer) glyphFace(style uint8) font.Face {
+	isBold := (style & 0x1) != 0
+	isItalic := (style & 0x2) != 0
+
+	if isBold && isItalic && r.faceBoldItalic != nil {
+		return r.faceBoldItalic
+	}
+	if isBold && r.faceBold != nil {
+		return r.faceBold
+	}
+	if isItalic && r.faceItalic != nil {
+		return r.faceItalic
+	}
+	return r.faceRegular
+}
+
+func (r *GUIRenderer) getGlyph(char rune, style uint8) *ebiten.Image {
+	key := glyphKey{char: char, style: style}
+	if img, ok := r.glyphCache[key]; ok {
 		return img
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, r.cellW, r.cellH))
 
-	if r.face != nil {
+	face := r.glyphFace(style)
+	if face != nil {
 		d := font.Drawer{
 			Dst:  img,
 			Src:  image.NewUniform(color.White),
-			Face: r.face,
+			Face: face,
 		}
 		d.Dot = fixed.P(0, r.glyphBaseline)
 		d.DrawString(string(char))
 	}
 
 	eImg := ebiten.NewImageFromImage(img)
-	r.glyphCache[char] = eImg
+	r.glyphCache[key] = eImg
 	return eImg
 }
 
@@ -446,7 +518,14 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 				char = ' '
 			}
 
-			snap := cellSnapshot{char: char, fg: cell.FgColor, bg: cell.BgColor, bold: cell.Bold}
+			snap := cellSnapshot{
+				char:      char,
+				fg:        cell.FgColor,
+				bg:        cell.BgColor,
+				bold:      cell.Bold,
+				italic:    cell.Italic,
+				underline: cell.Underline,
+			}
 			if forceFull || snap != r.prevBuffer[y][x] {
 				r.prevBuffer[y][x] = snap
 				r.drawCellGPU(x, y, snap)
@@ -486,19 +565,39 @@ func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
 	opts.CompositeMode = ebiten.CompositeModeCopy
 	r.framebuffer.DrawImage(r.whitePixel, opts)
 
-	if snap.char == ' ' || r.face == nil {
+	if snap.char == ' ' || r.faceRegular == nil {
 		return
 	}
 
 	// Foreground
 	fg := r.resolveColor(snap.fg, true, snap.bold)
 	fg = r.ensureReadableForeground(fg, bg)
-	glyph := r.getGlyph(snap.char)
+	style := uint8(0)
+	if snap.bold {
+		style |= 0x1
+	}
+	if snap.italic {
+		style |= 0x2
+	}
+	glyph := r.getGlyph(snap.char, style)
 
 	opts = &ebiten.DrawImageOptions{}
 	opts.GeoM.Translate(px, py)
 	opts.ColorScale.ScaleWithColor(fg)
 	r.framebuffer.DrawImage(glyph, opts)
+
+	if snap.underline {
+		lineY := py + float64(r.cellH-2)
+		if lineY < py {
+			lineY = py
+		}
+		uOpts := &ebiten.DrawImageOptions{}
+		uOpts.GeoM.Scale(float64(r.cellW), 1)
+		uOpts.GeoM.Translate(px, lineY)
+		uOpts.ColorScale.ScaleWithColor(fg)
+		uOpts.CompositeMode = ebiten.CompositeModeSourceOver
+		r.framebuffer.DrawImage(r.whitePixel, uOpts)
+	}
 }
 
 func (r *GUIRenderer) redrawFromBuffer(x, y int) bool {
@@ -530,7 +629,7 @@ func (r *GUIRenderer) applyTheme(isDark bool) {
 
 	r.isDarkMode = isDark
 	r.theme = activeTheme(isDark)
-	r.glyphCache = make(map[rune]*ebiten.Image) // Clear cache for new colors
+	r.glyphCache = make(map[glyphKey]*ebiten.Image)
 	if r.term != nil {
 		r.term.RequestFullRedraw()
 	}

@@ -56,10 +56,14 @@ func (p *Parser) Process(data []byte) {
 				} else if r == '\b' {
 					p.terminal.moveCursor(p.terminal.Cursor.X-1, p.terminal.Cursor.Y)
 				} else if r == '\n' {
-					p.terminal.Cursor.Y++
-					if p.terminal.Cursor.Y >= p.terminal.Height {
-						p.terminal.scrollUp()
-						p.terminal.Cursor.Y = p.terminal.Height - 1
+					p.terminal.normalizeScrollRegionLocked()
+					if p.terminal.Cursor.Y == p.terminal.ScrollBottom {
+						p.terminal.scrollUpRegionLocked(p.terminal.ScrollTop, p.terminal.ScrollBottom)
+					} else {
+						p.terminal.Cursor.Y++
+						if p.terminal.Cursor.Y >= p.terminal.Height {
+							p.terminal.Cursor.Y = p.terminal.Height - 1
+						}
 					}
 				} else if r == '\t' {
 					// Advance to next tab stop (every 8 columns)
@@ -108,16 +112,25 @@ func (p *Parser) Process(data []byte) {
 				p.state = StateOSC
 				p.oscBuilder.Reset()
 			case 'M': // Reverse Index — scroll down
-				if p.terminal.Cursor.Y > 0 {
+				p.terminal.normalizeScrollRegionLocked()
+				if p.terminal.Cursor.Y == p.terminal.ScrollTop {
+					p.terminal.scrollDownRegionLocked(p.terminal.ScrollTop, p.terminal.ScrollBottom)
+				} else if p.terminal.Cursor.Y > 0 {
 					p.terminal.Cursor.Y--
-				} else {
-					// Insert line at top
-					p.terminal.insertLine(1)
 				}
 				p.state = StateNormal
-			case '7': // Save cursor
+			case '7': // DECSC — Save cursor
+				p.terminal.savedCursor = cursorState{
+					cursor:    p.terminal.Cursor,
+					fg:        p.terminal.CurrentFg,
+					bg:        p.terminal.CurrentBg,
+					bold:      p.terminal.CurrentBold,
+					italic:    p.terminal.CurrentItalic,
+					underline: p.terminal.CurrentUnderline,
+				}
 				p.state = StateNormal
-			case '8': // Restore cursor
+			case '8': // DECRC — Restore cursor
+				p.terminal.restoreCursorLocked(p.terminal.savedCursor)
 				p.state = StateNormal
 			case '(', ')': // Character set designation — consume next byte
 				if i < len(data) {
@@ -226,6 +239,8 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 				p.terminal.CurrentFg = ColorDefault
 				p.terminal.CurrentBg = ColorDefault
 				p.terminal.CurrentBold = false
+				p.terminal.CurrentItalic = false
+				p.terminal.CurrentUnderline = false
 				continue
 			}
 
@@ -234,15 +249,19 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 			case code == 1:
 				p.terminal.CurrentBold = true
 			case code == 2: // Dim — ignore
-			case code == 3: // Italic — ignore for now
-			case code == 4: // Underline — ignore for now
+			case code == 3: // Italic
+				p.terminal.CurrentItalic = true
+			case code == 4: // Underline
+				p.terminal.CurrentUnderline = true
 			case code == 5, code == 6: // Blink — ignore
 			case code == 7: // Reverse video — swap fg/bg
 				p.terminal.CurrentFg, p.terminal.CurrentBg = p.terminal.CurrentBg, p.terminal.CurrentFg
 			case code == 22:
 				p.terminal.CurrentBold = false
 			case code == 23: // Italic off
+				p.terminal.CurrentItalic = false
 			case code == 24: // Underline off
+				p.terminal.CurrentUnderline = false
 			case code == 27: // Reverse off
 			case code >= 30 && code <= 37:
 				p.terminal.CurrentFg = Color(code - 30)
@@ -290,9 +309,8 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 			// Handle common private modes
 			for _, p2 := range params {
 				switch p2 {
-				case "1049": // Alt screen — clear for now
-					p.terminal.clear()
-					p.terminal.UseAltScreen = true
+				case "47", "1047", "1049": // Alt screen
+					p.terminal.enterAltScreenLocked()
 				case "25": // Show cursor — ignore
 				}
 			}
@@ -301,9 +319,8 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 		if private {
 			for _, p2 := range params {
 				switch p2 {
-				case "1049": // Leave alt screen
-					p.terminal.clear()
-					p.terminal.UseAltScreen = false
+				case "47", "1047", "1049": // Leave alt screen
+					p.terminal.exitAltScreenLocked()
 				case "25": // Hide cursor — ignore
 				}
 			}
@@ -312,7 +329,16 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 	case 'n': // Device Status Report
 		// Could implement cursor position report later
 
-	case 'r': // Set Scrolling Region — store but don't enforce for now
+	case 'r': // Set Scrolling Region (DECSTBM)
+		top := 1
+		bottom := p.terminal.Height
+		if len(params) >= 1 && params[0] != "" {
+			top, _ = strconv.Atoi(params[0])
+		}
+		if len(params) >= 2 && params[1] != "" {
+			bottom, _ = strconv.Atoi(params[1])
+		}
+		p.terminal.setScrollRegionLocked(top-1, bottom-1)
 
 	case 'L': // Insert Line
 		num := 1
@@ -394,8 +420,9 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 		if len(params) >= 1 && params[0] != "" {
 			num, _ = strconv.Atoi(params[0])
 		}
+		p.terminal.normalizeScrollRegionLocked()
 		for i := 0; i < num; i++ {
-			p.terminal.scrollUp()
+			p.terminal.scrollUpRegionLocked(p.terminal.ScrollTop, p.terminal.ScrollBottom)
 		}
 
 	case 'T': // Scroll Down — insert lines at top
@@ -403,9 +430,9 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 		if len(params) >= 1 && params[0] != "" {
 			num, _ = strconv.Atoi(params[0])
 		}
-		savedY := p.terminal.Cursor.Y
-		p.terminal.Cursor.Y = 0
-		p.terminal.insertLine(num)
-		p.terminal.Cursor.Y = savedY
+		p.terminal.normalizeScrollRegionLocked()
+		for i := 0; i < num; i++ {
+			p.terminal.scrollDownRegionLocked(p.terminal.ScrollTop, p.terminal.ScrollBottom)
+		}
 	}
 }

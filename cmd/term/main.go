@@ -64,6 +64,8 @@ func main() {
 	// Bridge GUI keys to PTY
 	rend.SetKeyHandler(func(key ebiten.Key) {
 		shiftPressed := ebiten.IsKeyPressed(ebiten.KeyShiftLeft) || ebiten.IsKeyPressed(ebiten.KeyShiftRight)
+		ctrlPressed := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyControlLeft) || ebiten.IsKeyPressed(ebiten.KeyControlRight)
+		altPressed := ebiten.IsKeyPressed(ebiten.KeyAlt) || ebiten.IsKeyPressed(ebiten.KeyAltLeft) || ebiten.IsKeyPressed(ebiten.KeyAltRight)
 		scrollbackActive := term.IsViewingScrollback()
 		altScreenActive := term.IsAltScreenActive()
 		send := func(data []byte) {
@@ -71,58 +73,107 @@ func main() {
 			manager.Write(data)
 		}
 
+		// Ctrl key chords (critical for Neovim and TUIs).
+		if ctrlPressed {
+			if key >= ebiten.KeyA && key <= ebiten.KeyZ {
+				send([]byte{byte(key - ebiten.KeyA + 1)})
+				return
+			}
+			if key == ebiten.KeySpace {
+				send([]byte{0x00})
+				return
+			}
+		}
+
+		// Alt/Meta key chords for non-text keys (basic support).
+		prefixAlt := func(seq []byte) []byte {
+			if !altPressed {
+				return seq
+			}
+			out := make([]byte, 0, len(seq)+1)
+			out = append(out, 0x1b)
+			out = append(out, seq...)
+			return out
+		}
+
 		switch key {
 		case ebiten.KeyEnter, ebiten.KeyNumpadEnter:
-			send([]byte{'\r'})
+			send(prefixAlt([]byte{'\r'}))
 		case ebiten.KeyBackspace:
-			send([]byte{0x7f})
+			send(prefixAlt([]byte{0x7f}))
 		case ebiten.KeyTab:
-			send([]byte{'\t'})
+			send(prefixAlt([]byte{'\t'}))
 		case ebiten.KeyUp:
 			if !altScreenActive && (shiftPressed || scrollbackActive) {
 				term.ScrollUpLines(1)
 				return
 			}
-			send([]byte("\x1b[A"))
+			send(prefixAlt([]byte("\x1b[A")))
 		case ebiten.KeyDown:
 			if !altScreenActive && (shiftPressed || scrollbackActive) {
 				term.ScrollDownLines(1)
 				return
 			}
-			send([]byte("\x1b[B"))
+			send(prefixAlt([]byte("\x1b[B")))
 		case ebiten.KeyRight:
-			send([]byte("\x1b[C"))
+			send(prefixAlt([]byte("\x1b[C")))
 		case ebiten.KeyLeft:
-			send([]byte("\x1b[D"))
+			send(prefixAlt([]byte("\x1b[D")))
 		case ebiten.KeyHome:
 			if !altScreenActive && scrollbackActive {
 				term.ScrollToTop()
 				return
 			}
-			send([]byte("\x1b[H"))
+			send(prefixAlt([]byte("\x1b[H")))
 		case ebiten.KeyEnd:
 			if !altScreenActive && scrollbackActive {
 				term.ScrollToBottom()
 				return
 			}
-			send([]byte("\x1b[F"))
+			send(prefixAlt([]byte("\x1b[F")))
 		case ebiten.KeyPageUp:
 			if !altScreenActive {
 				term.ScrollPageUp()
 				return
 			}
-			send([]byte("\x1b[5~"))
+			send(prefixAlt([]byte("\x1b[5~")))
 		case ebiten.KeyPageDown:
 			if !altScreenActive {
 				term.ScrollPageDown()
 				return
 			}
-			send([]byte("\x1b[6~"))
+			send(prefixAlt([]byte("\x1b[6~")))
+		case ebiten.KeyInsert:
+			send(prefixAlt([]byte("\x1b[2~")))
 		case ebiten.KeyDelete:
-			send([]byte("\x1b[3~"))
+			send(prefixAlt([]byte("\x1b[3~")))
 		case ebiten.KeyEscape:
 			term.ScrollToBottom()
 			manager.Write([]byte{0x1b})
+		case ebiten.KeyF1:
+			send(prefixAlt([]byte("\x1bOP")))
+		case ebiten.KeyF2:
+			send(prefixAlt([]byte("\x1bOQ")))
+		case ebiten.KeyF3:
+			send(prefixAlt([]byte("\x1bOR")))
+		case ebiten.KeyF4:
+			send(prefixAlt([]byte("\x1bOS")))
+		case ebiten.KeyF5:
+			send(prefixAlt([]byte("\x1b[15~")))
+		case ebiten.KeyF6:
+			send(prefixAlt([]byte("\x1b[17~")))
+		case ebiten.KeyF7:
+			send(prefixAlt([]byte("\x1b[18~")))
+		case ebiten.KeyF8:
+			send(prefixAlt([]byte("\x1b[19~")))
+		case ebiten.KeyF9:
+			send(prefixAlt([]byte("\x1b[20~")))
+		case ebiten.KeyF10:
+			send(prefixAlt([]byte("\x1b[21~")))
+		case ebiten.KeyF11:
+			send(prefixAlt([]byte("\x1b[23~")))
+		case ebiten.KeyF12:
+			send(prefixAlt([]byte("\x1b[24~")))
 		}
 	})
 

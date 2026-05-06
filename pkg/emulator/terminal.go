@@ -15,14 +15,15 @@ const (
 
 // Cell represents a single character on the terminal grid with its styling.
 type Cell struct {
-	Char     rune
-	FgColor  Color
-	BgColor  Color
-	Bold     bool
-	Italic   bool
-	Wide     bool // Whether this is the first half of a wide character
-	WideCont bool // Whether this is the second half of a wide character
-	Modified bool // Dirty flag — set when cell changes, cleared after render
+	Char      rune
+	FgColor   Color
+	BgColor   Color
+	Bold      bool
+	Italic    bool
+	Underline bool
+	Wide      bool // Whether this is the first half of a wide character
+	WideCont  bool // Whether this is the second half of a wide character
+	Modified  bool // Dirty flag — set when cell changes, cleared after render
 }
 
 // Terminal represents the state of the terminal emulator.
@@ -37,9 +38,18 @@ type Terminal struct {
 	ViewOffset    int // Lines scrolled up from bottom.
 
 	// Current styling
-	CurrentFg   Color
-	CurrentBg   Color
-	CurrentBold bool
+	CurrentFg        Color
+	CurrentBg        Color
+	CurrentBold      bool
+	CurrentItalic    bool
+	CurrentUnderline bool
+
+	// Scrolling region (inclusive). Defaults to full screen.
+	ScrollTop    int
+	ScrollBottom int
+
+	savedCursor cursorState
+	alt         *altScreenState
 
 	// Dirty tracking — DirtyRows[y] is true if any cell in row y changed.
 	DirtyRows     []bool
@@ -48,6 +58,33 @@ type Terminal struct {
 	UseAltScreen  bool
 
 	mu sync.Mutex
+}
+
+type cursorState struct {
+	cursor    Cursor
+	fg        Color
+	bg        Color
+	bold      bool
+	italic    bool
+	underline bool
+}
+
+type altScreenState struct {
+	grid         [][]Cell
+	dirtyRows    []bool
+	cursor       Cursor
+	scrollback   [][]Cell
+	viewOffset   int
+	scrollTop    int
+	scrollBottom int
+
+	currentFg        Color
+	currentBg        Color
+	currentBold      bool
+	currentItalic    bool
+	currentUnderline bool
+
+	savedCursor cursorState
 }
 
 // Cursor represents the current position and state of the cursor.
@@ -80,6 +117,8 @@ func NewTerminal(width, height int) *Terminal {
 		MaxScrollback: 5000,
 		CurrentFg:     ColorDefault,
 		CurrentBg:     ColorDefault,
+		ScrollTop:     0,
+		ScrollBottom:  height - 1,
 		DirtyRows:     dirtyRows,
 		ForceRedraw:   true,
 	}
@@ -125,8 +164,9 @@ func (t *Terminal) putChar(r rune) {
 	}
 
 	if t.Cursor.Y >= t.Height {
-		t.scrollUp()
-		t.Cursor.Y = t.Height - 1
+		t.normalizeScrollRegionLocked()
+		t.scrollUpRegionLocked(t.ScrollTop, t.ScrollBottom)
+		t.Cursor.Y = t.ScrollBottom
 	}
 
 	// Wrap if at end of line or if wide char won't fit
@@ -134,19 +174,22 @@ func (t *Terminal) putChar(r rune) {
 		t.Cursor.X = 0
 		t.Cursor.Y++
 		if t.Cursor.Y >= t.Height {
-			t.scrollUp()
-			t.Cursor.Y = t.Height - 1
+			t.normalizeScrollRegionLocked()
+			t.scrollUpRegionLocked(t.ScrollTop, t.ScrollBottom)
+			t.Cursor.Y = t.ScrollBottom
 		}
 	}
 
 	// Place the character
 	t.Grid[t.Cursor.Y][t.Cursor.X] = Cell{
-		Char:     r,
-		FgColor:  t.CurrentFg,
-		BgColor:  t.CurrentBg,
-		Bold:     t.CurrentBold,
-		Wide:     w > 1,
-		Modified: true,
+		Char:      r,
+		FgColor:   t.CurrentFg,
+		BgColor:   t.CurrentBg,
+		Bold:      t.CurrentBold,
+		Italic:    t.CurrentItalic,
+		Underline: t.CurrentUnderline,
+		Wide:      w > 1,
+		Modified:  true,
 	}
 	t.DirtyRows[t.Cursor.Y] = true
 
@@ -154,11 +197,13 @@ func (t *Terminal) putChar(r rune) {
 		// Mark the next cell as a continuation
 		if t.Cursor.X+1 < t.Width {
 			t.Grid[t.Cursor.Y][t.Cursor.X+1] = Cell{
-				Char:     ' ',
-				FgColor:  t.CurrentFg,
-				BgColor:  t.CurrentBg,
-				WideCont: true,
-				Modified: true,
+				Char:      ' ',
+				FgColor:   t.CurrentFg,
+				BgColor:   t.CurrentBg,
+				Italic:    t.CurrentItalic,
+				Underline: t.CurrentUnderline,
+				WideCont:  true,
+				Modified:  true,
 			}
 		}
 	}
@@ -166,9 +211,64 @@ func (t *Terminal) putChar(r rune) {
 	t.Cursor.X += w
 }
 
-// scrollUp scrolls the terminal grid up by one line.
-func (t *Terminal) scrollUp() {
-	if t.Height > 0 && len(t.Grid) > 0 {
+func (t *Terminal) blankLine() []Cell {
+	line := make([]Cell, t.Width)
+	for j := range line {
+		line[j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
+	}
+	return line
+}
+
+func (t *Terminal) normalizeScrollRegionLocked() {
+	if t.Height <= 0 {
+		t.ScrollTop = 0
+		t.ScrollBottom = -1
+		return
+	}
+	if t.ScrollTop < 0 {
+		t.ScrollTop = 0
+	}
+	if t.ScrollBottom < 0 {
+		t.ScrollBottom = t.Height - 1
+	}
+	if t.ScrollTop >= t.Height {
+		t.ScrollTop = t.Height - 1
+	}
+	if t.ScrollBottom >= t.Height {
+		t.ScrollBottom = t.Height - 1
+	}
+	if t.ScrollTop > t.ScrollBottom {
+		t.ScrollTop = 0
+		t.ScrollBottom = t.Height - 1
+	}
+}
+
+func (t *Terminal) setScrollRegionLocked(top, bottom int) {
+	t.ScrollTop = top
+	t.ScrollBottom = bottom
+	t.normalizeScrollRegionLocked()
+	// xterm behavior: move cursor to home position (1,1)
+	t.moveCursor(0, 0)
+}
+
+// scrollUpRegionLocked scrolls the scrolling region up by one line.
+// When the region covers the full screen and we're not in alt screen, the top line is appended to scrollback.
+func (t *Terminal) scrollUpRegionLocked(top, bottom int) {
+	if t.Height <= 0 || t.Width <= 0 || len(t.Grid) == 0 {
+		return
+	}
+	if top < 0 {
+		top = 0
+	}
+	if bottom >= t.Height {
+		bottom = t.Height - 1
+	}
+	if top > bottom {
+		return
+	}
+
+	fullRegion := top == 0 && bottom == t.Height-1
+	if fullRegion && !t.UseAltScreen && len(t.Grid) > 0 {
 		line := make([]Cell, len(t.Grid[0]))
 		copy(line, t.Grid[0])
 		t.Scrollback = append(t.Scrollback, line)
@@ -180,16 +280,36 @@ func (t *Terminal) scrollUp() {
 		}
 	}
 
-	copy(t.Grid[0:], t.Grid[1:])
-	copy(t.DirtyRows[0:], t.DirtyRows[1:])
-	t.Grid[t.Height-1] = make([]Cell, t.Width)
-	for j := range t.Grid[t.Height-1] {
-		t.Grid[t.Height-1][j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
+	copy(t.Grid[top:bottom], t.Grid[top+1:bottom+1])
+	for y := top; y <= bottom; y++ {
+		t.DirtyRows[y] = true
 	}
-	t.DirtyRows[t.Height-1] = true
-	if t.ViewOffset == 0 {
+	t.Grid[bottom] = t.blankLine()
+	if fullRegion && t.ViewOffset == 0 {
 		t.PendingScroll++
 	}
+}
+
+func (t *Terminal) scrollDownRegionLocked(top, bottom int) {
+	if t.Height <= 0 || t.Width <= 0 || len(t.Grid) == 0 {
+		return
+	}
+	if top < 0 {
+		top = 0
+	}
+	if bottom >= t.Height {
+		bottom = t.Height - 1
+	}
+	if top > bottom {
+		return
+	}
+
+	for y := bottom; y > top; y-- {
+		t.Grid[y] = t.Grid[y-1]
+		t.DirtyRows[y] = true
+	}
+	t.Grid[top] = t.blankLine()
+	t.DirtyRows[top] = true
 }
 
 // Clear clears the terminal grid.
@@ -208,6 +328,8 @@ func (t *Terminal) clear() {
 	}
 	t.Cursor = Cursor{X: 0, Y: 0}
 	t.ViewOffset = 0
+	t.ScrollTop = 0
+	t.ScrollBottom = t.Height - 1
 	t.ForceRedraw = true
 }
 
@@ -282,17 +404,26 @@ func (t *Terminal) insertLine(n int) {
 	if t.Cursor.Y+n > t.Height {
 		n = t.Height - t.Cursor.Y
 	}
-	for y := t.Height - 1; y >= t.Cursor.Y+n; y-- {
+	t.normalizeScrollRegionLocked()
+	top := t.ScrollTop
+	bottom := t.ScrollBottom
+	if t.Cursor.Y < top || t.Cursor.Y > bottom {
+		top = 0
+		bottom = t.Height - 1
+	}
+	if t.Cursor.Y+n > bottom+1 {
+		n = bottom + 1 - t.Cursor.Y
+	}
+	if n <= 0 {
+		return
+	}
+
+	for y := bottom; y >= t.Cursor.Y+n; y-- {
 		t.Grid[y] = t.Grid[y-n]
+		t.DirtyRows[y] = true
 	}
 	for y := t.Cursor.Y; y < t.Cursor.Y+n; y++ {
-		t.Grid[y] = make([]Cell, t.Width)
-		for x := range t.Grid[y] {
-			t.Grid[y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
-		}
-	}
-	// Mark all rows from cursor down as dirty
-	for y := t.Cursor.Y; y < t.Height; y++ {
+		t.Grid[y] = t.blankLine()
 		t.DirtyRows[y] = true
 	}
 }
@@ -308,16 +439,26 @@ func (t *Terminal) deleteLine(n int) {
 	if t.Cursor.Y+n > t.Height {
 		n = t.Height - t.Cursor.Y
 	}
-	for y := t.Cursor.Y; y < t.Height-n; y++ {
+	t.normalizeScrollRegionLocked()
+	top := t.ScrollTop
+	bottom := t.ScrollBottom
+	if t.Cursor.Y < top || t.Cursor.Y > bottom {
+		top = 0
+		bottom = t.Height - 1
+	}
+	if t.Cursor.Y+n > bottom+1 {
+		n = bottom + 1 - t.Cursor.Y
+	}
+	if n <= 0 {
+		return
+	}
+
+	for y := t.Cursor.Y; y <= bottom-n; y++ {
 		t.Grid[y] = t.Grid[y+n]
+		t.DirtyRows[y] = true
 	}
-	for y := t.Height - n; y < t.Height; y++ {
-		t.Grid[y] = make([]Cell, t.Width)
-		for x := range t.Grid[y] {
-			t.Grid[y][x] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
-		}
-	}
-	for y := t.Cursor.Y; y < t.Height; y++ {
+	for y := bottom - n + 1; y <= bottom; y++ {
+		t.Grid[y] = t.blankLine()
 		t.DirtyRows[y] = true
 	}
 }
@@ -436,6 +577,127 @@ func (t *Terminal) Resize(width, height int) {
 	}
 	t.PendingScroll = 0
 	t.ForceRedraw = true
+
+	if t.Height > 0 {
+		if t.ScrollBottom >= t.Height || t.ScrollBottom < 0 {
+			t.ScrollBottom = t.Height - 1
+		}
+		if t.ScrollTop >= t.Height || t.ScrollTop < 0 {
+			t.ScrollTop = 0
+		}
+		t.normalizeScrollRegionLocked()
+	}
+}
+
+func (t *Terminal) SaveCursor() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.savedCursor = cursorState{
+		cursor:    t.Cursor,
+		fg:        t.CurrentFg,
+		bg:        t.CurrentBg,
+		bold:      t.CurrentBold,
+		italic:    t.CurrentItalic,
+		underline: t.CurrentUnderline,
+	}
+}
+
+func (t *Terminal) RestoreCursor() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.restoreCursorLocked(t.savedCursor)
+}
+
+func (t *Terminal) restoreCursorLocked(s cursorState) {
+	t.CurrentFg = s.fg
+	t.CurrentBg = s.bg
+	t.CurrentBold = s.bold
+	t.CurrentItalic = s.italic
+	t.CurrentUnderline = s.underline
+	t.moveCursor(s.cursor.X, s.cursor.Y)
+}
+
+func (t *Terminal) SetScrollRegion(top, bottom int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.setScrollRegionLocked(top, bottom)
+}
+
+func (t *Terminal) EnterAltScreen() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.enterAltScreenLocked()
+}
+
+func (t *Terminal) enterAltScreenLocked() {
+	if t.UseAltScreen {
+		return
+	}
+	t.normalizeScrollRegionLocked()
+
+	mainGrid := t.Grid
+	mainDirty := t.DirtyRows
+	t.alt = &altScreenState{
+		grid:             mainGrid,
+		dirtyRows:        mainDirty,
+		cursor:           t.Cursor,
+		scrollback:       t.Scrollback,
+		viewOffset:       t.ViewOffset,
+		scrollTop:        t.ScrollTop,
+		scrollBottom:     t.ScrollBottom,
+		currentFg:        t.CurrentFg,
+		currentBg:        t.CurrentBg,
+		currentBold:      t.CurrentBold,
+		currentItalic:    t.CurrentItalic,
+		currentUnderline: t.CurrentUnderline,
+		savedCursor:      t.savedCursor,
+	}
+
+	t.UseAltScreen = true
+	t.Scrollback = nil
+	t.ViewOffset = 0
+	t.ScrollTop = 0
+	t.ScrollBottom = t.Height - 1
+	t.Cursor = Cursor{X: 0, Y: 0}
+	t.Grid = make([][]Cell, t.Height)
+	t.DirtyRows = make([]bool, t.Height)
+	for y := 0; y < t.Height; y++ {
+		t.Grid[y] = t.blankLine()
+		t.DirtyRows[y] = true
+	}
+	t.markAllDirty()
+}
+
+func (t *Terminal) ExitAltScreen() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.exitAltScreenLocked()
+}
+
+func (t *Terminal) exitAltScreenLocked() {
+	if !t.UseAltScreen || t.alt == nil {
+		t.UseAltScreen = false
+		return
+	}
+
+	s := t.alt
+	t.Grid = s.grid
+	t.DirtyRows = s.dirtyRows
+	t.Cursor = s.cursor
+	t.Scrollback = s.scrollback
+	t.ViewOffset = s.viewOffset
+	t.ScrollTop = s.scrollTop
+	t.ScrollBottom = s.scrollBottom
+	t.CurrentFg = s.currentFg
+	t.CurrentBg = s.currentBg
+	t.CurrentBold = s.currentBold
+	t.CurrentItalic = s.currentItalic
+	t.CurrentUnderline = s.currentUnderline
+	t.savedCursor = s.savedCursor
+
+	t.UseAltScreen = false
+	t.alt = nil
+	t.markAllDirty()
 }
 
 func (t *Terminal) maxViewOffsetLocked() int {

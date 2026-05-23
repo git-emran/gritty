@@ -4,7 +4,6 @@ import (
 	"image"
 	"image/color"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -59,6 +58,8 @@ type GUIRenderer struct {
 	runeHandler   func(rn rune)
 	wheelHandler  func(dx, dy float64)
 
+	changedCells []drawJob
+
 	term *emulator.Terminal
 }
 
@@ -69,6 +70,12 @@ type cellSnapshot struct {
 	bold      bool
 	italic    bool
 	underline bool
+}
+
+type drawJob struct {
+	x    int
+	y    int
+	snap cellSnapshot
 }
 
 type glyphKey struct {
@@ -442,50 +449,13 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 		forceFull = true
 	}
 
-	dirtyRows := make([]bool, len(t.DirtyRows))
-	copy(dirtyRows, t.DirtyRows)
-	for y := 0; y < len(t.DirtyRows); y++ {
-		t.DirtyRows[y] = false
+	if cap(r.changedCells) < width*height {
+		r.changedCells = make([]drawJob, 0, width*height)
 	}
+	r.changedCells = r.changedCells[:0]
 
-	viewRows := make([][]emulator.Cell, height)
-	for y := 0; y < height; y++ {
-		if forceFull || shift > 0 || (y < len(dirtyRows) && dirtyRows[y]) {
-			row := t.ViewRow(y)
-			if row != nil {
-				viewRows[y] = make([]emulator.Cell, len(row))
-				copy(viewRows[y], row)
-			}
-		}
-	}
-	t.Unlock()
-
-	cursorChanged := r.prevCursorX != cx || r.prevCursorY != cy
-	cursorVisibilityChanged := r.cursorVisible != r.lastCursorVisible
-
-	hasDirtyRows := forceFull || shift > 0
-	if !hasDirtyRows {
-		for y := 0; y < len(dirtyRows); y++ {
-			if dirtyRows[y] {
-				hasDirtyRows = true
-				break
-			}
-		}
-	}
-
-	if !hasDirtyRows && !cursorChanged && !cursorVisibilityChanged {
-		return false
-	}
-
-	// Process hardware scrolling
+	// Process shift in prevBuffer under lock to keep it in sync with the Grid
 	if shift > 0 && !forceFull {
-		r.backbuffer.Clear()
-		opts := &ebiten.DrawImageOptions{}
-		opts.GeoM.Translate(0, float64(-shift*r.cellH))
-		r.backbuffer.DrawImage(r.framebuffer, opts)
-		r.framebuffer, r.backbuffer = r.backbuffer, r.framebuffer
-
-		// Shift prevBuffer so we don't redraw everything
 		if shift < height {
 			copy(r.prevBuffer[0:], r.prevBuffer[shift:])
 			for y := height - shift; y < height; y++ {
@@ -502,17 +472,23 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 		}
 	}
 
-	changed := shift > 0
+	// Capture modified cells directly under the lock (extremely fast struct comparison)
 	for y := 0; y < height; y++ {
-		if !forceFull && (y >= len(dirtyRows) || !dirtyRows[y]) {
+		isRowDirty := forceFull || shift > 0 || (y < len(t.DirtyRows) && t.DirtyRows[y])
+		if y < len(t.DirtyRows) {
+			t.DirtyRows[y] = false
+		}
+		if !isRowDirty {
 			continue
 		}
-		row := viewRows[y]
+
+		row := t.ViewRow(y)
+		if row == nil {
+			continue
+		}
+
 		for x := 0; x < width; x++ {
-			cell := emulator.Cell{Char: ' ', FgColor: emulator.ColorDefault, BgColor: emulator.ColorDefault}
-			if row != nil && x < len(row) {
-				cell = row[x]
-			}
+			cell := row[x]
 			char := cell.Char
 			if char == 0 || cell.WideCont {
 				char = ' '
@@ -526,30 +502,51 @@ func (r *GUIRenderer) renderTerm(t *emulator.Terminal) bool {
 				italic:    cell.Italic,
 				underline: cell.Underline,
 			}
+
 			if forceFull || snap != r.prevBuffer[y][x] {
 				r.prevBuffer[y][x] = snap
-				r.drawCellGPU(x, y, snap)
-				changed = true
+				r.changedCells = append(r.changedCells, drawJob{x: x, y: y, snap: snap})
 			}
 		}
 	}
+	t.Unlock()
+
+	cursorChanged := r.prevCursorX != cx || r.prevCursorY != cy
+	cursorVisibilityChanged := r.cursorVisible != r.lastCursorVisible
+
+	changed := shift > 0 || len(r.changedCells) > 0 || cursorChanged || cursorVisibilityChanged
+
+	if !changed {
+		return false
+	}
+
+	// Process hardware scrolling on GPU (outside the lock)
+	if shift > 0 && !forceFull {
+		r.backbuffer.Clear()
+		opts := &ebiten.DrawImageOptions{}
+		opts.GeoM.Translate(0, float64(-shift*r.cellH))
+		r.backbuffer.DrawImage(r.framebuffer, opts)
+		r.framebuffer, r.backbuffer = r.backbuffer, r.framebuffer
+	}
+
+	// Draw changed cells to GPU (outside the lock)
+	for _, job := range r.changedCells {
+		r.drawCellGPU(job.x, job.y, job.snap)
+	}
 
 	if cursorChanged || cursorVisibilityChanged {
-		if r.redrawFromBuffer(r.prevCursorX, r.prevCursorY) {
-			changed = true
-		}
+		r.redrawFromBuffer(r.prevCursorX, r.prevCursorY)
 	}
 
 	if cursorInView && r.cursorVisible {
 		r.drawCursorGPU(cx, cy)
-		changed = true
 	}
 
 	r.prevCursorX = cx
 	r.prevCursorY = cy
 	r.lastCursorVisible = r.cursorVisible
 
-	return changed
+	return true
 }
 
 func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
@@ -571,7 +568,6 @@ func (r *GUIRenderer) drawCellGPU(x, y int, snap cellSnapshot) {
 
 	// Foreground
 	fg := r.resolveColor(snap.fg, true, snap.bold)
-	fg = r.ensureReadableForeground(fg, bg)
 	style := uint8(0)
 	if snap.bold {
 		style |= 0x1
@@ -689,75 +685,7 @@ func (r *GUIRenderer) ansi256Color(idx uint8) color.RGBA {
 	return color.RGBA{R: gray, G: gray, B: gray, A: 255}
 }
 
-func srgbToLinear(c uint8) float64 {
-	v := float64(c) / 255.0
-	if v <= 0.04045 {
-		return v / 12.92
-	}
-	return math.Pow((v+0.055)/1.055, 2.4)
-}
 
-func relativeLuminance(c color.RGBA) float64 {
-	r := srgbToLinear(c.R)
-	g := srgbToLinear(c.G)
-	b := srgbToLinear(c.B)
-	return 0.2126*r + 0.7152*g + 0.0722*b
-}
-
-func contrastRatio(a, b color.RGBA) float64 {
-	la := relativeLuminance(a)
-	lb := relativeLuminance(b)
-	if la < lb {
-		la, lb = lb, la
-	}
-	return (la + 0.05) / (lb + 0.05)
-}
-
-func blendColor(a, b color.RGBA, mix float64) color.RGBA {
-	if mix <= 0 {
-		return a
-	}
-	if mix >= 1 {
-		return b
-	}
-	inv := 1 - mix
-	return color.RGBA{
-		R: uint8(float64(a.R)*inv + float64(b.R)*mix),
-		G: uint8(float64(a.G)*inv + float64(b.G)*mix),
-		B: uint8(float64(a.B)*inv + float64(b.B)*mix),
-		A: 255,
-	}
-}
-
-func (r *GUIRenderer) ensureReadableForeground(fg, bg color.RGBA) color.RGBA {
-	if contrastRatio(fg, bg) >= 4.5 {
-		return fg
-	}
-
-	target := color.RGBA{
-		R: r.theme.foreground[0],
-		G: r.theme.foreground[1],
-		B: r.theme.foreground[2],
-		A: 255,
-	}
-	if contrastRatio(target, bg) < 4.5 {
-		light := color.RGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF}
-		dark := color.RGBA{R: 0x00, G: 0x00, B: 0x00, A: 0xFF}
-		if contrastRatio(light, bg) >= contrastRatio(dark, bg) {
-			target = light
-		} else {
-			target = dark
-		}
-	}
-
-	for step := 1; step <= 6; step++ {
-		candidate := blendColor(fg, target, float64(step)/6.0)
-		if contrastRatio(candidate, bg) >= 4.5 {
-			return candidate
-		}
-	}
-	return target
-}
 
 func (r *GUIRenderer) RenderCh() <-chan struct{} {
 	return r.renderCh

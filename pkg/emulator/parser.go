@@ -1,8 +1,6 @@
 package emulator
 
 import (
-	"strconv"
-	"strings"
 	"unicode/utf8"
 )
 
@@ -20,8 +18,9 @@ const (
 type Parser struct {
 	state      ParserState
 	terminal   *Terminal
-	csiBuilder strings.Builder // replaces string concat for csiParams
-	oscBuilder strings.Builder // replaces string concat for oscParams
+	csiParams  [32]int
+	csiCount   int
+	csiPrivate bool
 	utf8Buf    []byte
 }
 
@@ -107,10 +106,11 @@ func (p *Parser) Process(data []byte) {
 			switch r {
 			case '[':
 				p.state = StateCSI
-				p.csiBuilder.Reset()
+				p.csiCount = 0
+				p.csiPrivate = false
+				p.csiParams[0] = -1
 			case ']':
 				p.state = StateOSC
-				p.oscBuilder.Reset()
 			case 'M': // Reverse Index — scroll down
 				p.terminal.normalizeScrollRegionLocked()
 				if p.terminal.Cursor.Y == p.terminal.ScrollTop {
@@ -141,10 +141,25 @@ func (p *Parser) Process(data []byte) {
 				p.state = StateNormal
 			}
 		case StateCSI:
-			if (r >= '0' && r <= '9') || r == ';' || r == '?' || r == '>' || r == '!' || r == ' ' {
-				p.csiBuilder.WriteRune(r)
+			if r >= '0' && r <= '9' {
+				if p.csiCount < 32 {
+					if p.csiParams[p.csiCount] == -1 {
+						p.csiParams[p.csiCount] = int(r - '0')
+					} else {
+						p.csiParams[p.csiCount] = p.csiParams[p.csiCount]*10 + int(r - '0')
+					}
+				}
+			} else if r == ';' {
+				if p.csiCount < 31 {
+					p.csiCount++
+					p.csiParams[p.csiCount] = -1
+				}
+			} else if r == '?' || r == '>' {
+				p.csiPrivate = true
+			} else if r == '!' || r == ' ' {
+				// Ignore spaces and exclamations
 			} else {
-				p.handleCSI(r, p.csiBuilder.String())
+				p.handleCSI(r)
 				p.state = StateNormal
 			}
 		case StateOSC:
@@ -157,52 +172,43 @@ func (p *Parser) Process(data []byte) {
 					i++
 				}
 				p.state = StateNormal
-			} else {
-				p.oscBuilder.WriteRune(r)
 			}
 		}
 	}
 }
 
-func (p *Parser) handleCSI(cmd rune, rawParams string) {
-	// Strip leading '?' or '>' private mode markers
-	private := false
-	if len(rawParams) > 0 && (rawParams[0] == '?' || rawParams[0] == '>') {
-		private = true
-		rawParams = rawParams[1:]
-	}
-
-	params := strings.Split(rawParams, ";")
+func (p *Parser) handleCSI(cmd rune) {
+	paramCount := p.csiCount + 1
 
 	switch cmd {
 	case 'H', 'f': // Cursor Position
 		row, col := 1, 1
-		if len(params) >= 1 && params[0] != "" {
-			row, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			row = p.csiParams[0]
 		}
-		if len(params) >= 2 && params[1] != "" {
-			col, _ = strconv.Atoi(params[1])
+		if p.csiCount >= 1 && p.csiParams[1] != -1 {
+			col = p.csiParams[1]
 		}
 		p.terminal.moveCursor(col-1, row-1)
 
 	case 'G': // Cursor Horizontal Absolute
 		col := 1
-		if len(params) >= 1 && params[0] != "" {
-			col, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			col = p.csiParams[0]
 		}
 		p.terminal.moveCursor(col-1, p.terminal.Cursor.Y)
 
 	case 'd': // Cursor Vertical Absolute
 		row := 1
-		if len(params) >= 1 && params[0] != "" {
-			row, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			row = p.csiParams[0]
 		}
 		p.terminal.moveCursor(p.terminal.Cursor.X, row-1)
 
 	case 'J': // Erase in Display
 		mode := 0
-		if len(params) >= 1 && params[0] != "" {
-			mode, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			mode = p.csiParams[0]
 		}
 		switch mode {
 		case 0: // Erase from cursor to end of screen
@@ -227,15 +233,25 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 
 	case 'K': // Erase in Line
 		mode := 0
-		if len(params) >= 1 && params[0] != "" {
-			mode, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			mode = p.csiParams[0]
 		}
 		p.terminal.eraseInLine(mode)
 
 	case 'm': // Select Graphic Rendition (SGR)
-		for i := 0; i < len(params); i++ {
-			param := params[i]
-			if param == "" || param == "0" {
+		// Default: reset all styles if parameters are omitted
+		if paramCount == 1 && p.csiParams[0] == -1 {
+			p.terminal.CurrentFg = ColorDefault
+			p.terminal.CurrentBg = ColorDefault
+			p.terminal.CurrentBold = false
+			p.terminal.CurrentItalic = false
+			p.terminal.CurrentUnderline = false
+			break
+		}
+
+		for i := 0; i < paramCount; i++ {
+			code := p.csiParams[i]
+			if code == -1 || code == 0 {
 				p.terminal.CurrentFg = ColorDefault
 				p.terminal.CurrentBg = ColorDefault
 				p.terminal.CurrentBold = false
@@ -244,7 +260,6 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 				continue
 			}
 
-			code, _ := strconv.Atoi(param)
 			switch {
 			case code == 1:
 				p.terminal.CurrentBold = true
@@ -276,27 +291,31 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 			case code >= 100 && code <= 107:
 				p.terminal.CurrentBg = Color(code - 100 + 8)
 			case code == 38 || code == 48:
-				if i+1 < len(params) {
-					mode := params[i+1]
-					if mode == "5" && i+2 < len(params) {
+				if i+1 < paramCount {
+					mode := p.csiParams[i+1]
+					if mode == 5 && i+2 < paramCount {
 						// 256 color
-						val, _ := strconv.Atoi(params[i+2])
-						if code == 38 {
-							p.terminal.CurrentFg = Color(val)
-						} else {
-							p.terminal.CurrentBg = Color(val)
+						val := p.csiParams[i+2]
+						if val >= 0 && val <= 255 {
+							if code == 38 {
+								p.terminal.CurrentFg = Color(val)
+							} else {
+								p.terminal.CurrentBg = Color(val)
+							}
 						}
 						i += 2
-					} else if mode == "2" && i+4 < len(params) {
+					} else if mode == 2 && i+4 < paramCount {
 						// TrueColor
-						rv, _ := strconv.Atoi(params[i+2])
-						gv, _ := strconv.Atoi(params[i+3])
-						bv, _ := strconv.Atoi(params[i+4])
-						trueColor := uint32(0x01000000 | (rv << 16) | (gv << 8) | bv)
-						if code == 38 {
-							p.terminal.CurrentFg = Color(trueColor)
-						} else {
-							p.terminal.CurrentBg = Color(trueColor)
+						rv := p.csiParams[i+2]
+						gv := p.csiParams[i+3]
+						bv := p.csiParams[i+4]
+						if rv >= 0 && gv >= 0 && bv >= 0 {
+							trueColor := uint32(0x01000000 | ((rv & 0xFF) << 16) | ((gv & 0xFF) << 8) | (bv & 0xFF))
+							if code == 38 {
+								p.terminal.CurrentFg = Color(trueColor)
+							} else {
+								p.terminal.CurrentBg = Color(trueColor)
+							}
 						}
 						i += 4
 					}
@@ -305,23 +324,24 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 		}
 
 	case 'h': // Set Mode (DECSET)
-		if private {
-			// Handle common private modes
-			for _, p2 := range params {
+		if p.csiPrivate {
+			for i := 0; i < paramCount; i++ {
+				p2 := p.csiParams[i]
 				switch p2 {
-				case "47", "1047", "1049": // Alt screen
+				case 47, 1047, 1049: // Alt screen
 					p.terminal.enterAltScreenLocked()
-				case "25": // Show cursor — ignore
+				case 25: // Show cursor — ignore
 				}
 			}
 		}
 	case 'l': // Reset Mode (DECRST)
-		if private {
-			for _, p2 := range params {
+		if p.csiPrivate {
+			for i := 0; i < paramCount; i++ {
+				p2 := p.csiParams[i]
 				switch p2 {
-				case "47", "1047", "1049": // Leave alt screen
+				case 47, 1047, 1049: // Leave alt screen
 					p.terminal.exitAltScreenLocked()
-				case "25": // Hide cursor — ignore
+				case 25: // Hide cursor — ignore
 				}
 			}
 		}
@@ -332,46 +352,46 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 	case 'r': // Set Scrolling Region (DECSTBM)
 		top := 1
 		bottom := p.terminal.Height
-		if len(params) >= 1 && params[0] != "" {
-			top, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			top = p.csiParams[0]
 		}
-		if len(params) >= 2 && params[1] != "" {
-			bottom, _ = strconv.Atoi(params[1])
+		if p.csiCount >= 1 && p.csiParams[1] != -1 {
+			bottom = p.csiParams[1]
 		}
 		p.terminal.setScrollRegionLocked(top-1, bottom-1)
 
 	case 'L': // Insert Line
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		p.terminal.insertLine(num)
 
 	case 'M': // Delete Line
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		p.terminal.deleteLine(num)
 
 	case 'P': // Delete Character (DCH)
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		p.terminal.deleteChars(num)
 
 	case 'X': // Erase Character (ECH)
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		p.terminal.eraseChars(num)
 
 	case '@': // Insert Blank Characters
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		// Shift right, insert spaces
 		y := p.terminal.Cursor.Y
@@ -387,8 +407,8 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 
 	case 'A', 'B', 'C', 'D': // Cursor Up, Down, Forward, Back
 		dist := 1
-		if len(params) >= 1 && params[0] != "" {
-			dist, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			dist = p.csiParams[0]
 		}
 		switch cmd {
 		case 'A':
@@ -403,22 +423,22 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 
 	case 'E': // Cursor Next Line
 		dist := 1
-		if len(params) >= 1 && params[0] != "" {
-			dist, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			dist = p.csiParams[0]
 		}
 		p.terminal.moveCursor(0, p.terminal.Cursor.Y+dist)
 
 	case 'F': // Cursor Previous Line
 		dist := 1
-		if len(params) >= 1 && params[0] != "" {
-			dist, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			dist = p.csiParams[0]
 		}
 		p.terminal.moveCursor(0, p.terminal.Cursor.Y-dist)
 
 	case 'S': // Scroll Up
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		p.terminal.normalizeScrollRegionLocked()
 		for i := 0; i < num; i++ {
@@ -427,8 +447,8 @@ func (p *Parser) handleCSI(cmd rune, rawParams string) {
 
 	case 'T': // Scroll Down — insert lines at top
 		num := 1
-		if len(params) >= 1 && params[0] != "" {
-			num, _ = strconv.Atoi(params[0])
+		if p.csiParams[0] != -1 {
+			num = p.csiParams[0]
 		}
 		p.terminal.normalizeScrollRegionLocked()
 		for i := 0; i < num; i++ {

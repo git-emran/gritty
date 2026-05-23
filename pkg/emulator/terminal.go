@@ -280,11 +280,15 @@ func (t *Terminal) scrollUpRegionLocked(top, bottom int) {
 		}
 	}
 
+	tmp := t.Grid[top]
 	copy(t.Grid[top:bottom], t.Grid[top+1:bottom+1])
 	for y := top; y <= bottom; y++ {
 		t.DirtyRows[y] = true
 	}
-	t.Grid[bottom] = t.blankLine()
+	for i := range tmp {
+		tmp[i] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
+	}
+	t.Grid[bottom] = tmp
 	if fullRegion && t.ViewOffset == 0 {
 		t.PendingScroll++
 	}
@@ -304,11 +308,15 @@ func (t *Terminal) scrollDownRegionLocked(top, bottom int) {
 		return
 	}
 
+	tmp := t.Grid[bottom]
 	for y := bottom; y > top; y-- {
 		t.Grid[y] = t.Grid[y-1]
 		t.DirtyRows[y] = true
 	}
-	t.Grid[top] = t.blankLine()
+	for i := range tmp {
+		tmp[i] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
+	}
+	t.Grid[top] = tmp
 	t.DirtyRows[top] = true
 }
 
@@ -418,12 +426,27 @@ func (t *Terminal) insertLine(n int) {
 		return
 	}
 
+	// Recycle slices from the bottom that will be pushed out
+	var savedLocal [8][]Cell
+	var saved [][]Cell
+	if n <= 8 {
+		saved = savedLocal[:n]
+	} else {
+		saved = make([][]Cell, n)
+	}
+	copy(saved, t.Grid[bottom-n+1:bottom+1])
+
 	for y := bottom; y >= t.Cursor.Y+n; y-- {
 		t.Grid[y] = t.Grid[y-n]
 		t.DirtyRows[y] = true
 	}
-	for y := t.Cursor.Y; y < t.Cursor.Y+n; y++ {
-		t.Grid[y] = t.blankLine()
+	for i := 0; i < n; i++ {
+		y := t.Cursor.Y + i
+		tmp := saved[i]
+		for j := range tmp {
+			tmp[j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
+		}
+		t.Grid[y] = tmp
 		t.DirtyRows[y] = true
 	}
 }
@@ -453,12 +476,27 @@ func (t *Terminal) deleteLine(n int) {
 		return
 	}
 
+	// Recycle deleted slices
+	var savedLocal [8][]Cell
+	var saved [][]Cell
+	if n <= 8 {
+		saved = savedLocal[:n]
+	} else {
+		saved = make([][]Cell, n)
+	}
+	copy(saved, t.Grid[t.Cursor.Y:t.Cursor.Y+n])
+
 	for y := t.Cursor.Y; y <= bottom-n; y++ {
 		t.Grid[y] = t.Grid[y+n]
 		t.DirtyRows[y] = true
 	}
-	for y := bottom - n + 1; y <= bottom; y++ {
-		t.Grid[y] = t.blankLine()
+	for i := 0; i < n; i++ {
+		y := bottom - n + 1 + i
+		tmp := saved[i]
+		for j := range tmp {
+			tmp[j] = Cell{Char: ' ', FgColor: ColorDefault, BgColor: ColorDefault, Modified: true}
+		}
+		t.Grid[y] = tmp
 		t.DirtyRows[y] = true
 	}
 }

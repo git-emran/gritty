@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -13,6 +14,10 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"golang.org/x/image/font"
+	"golang.org/x/image/font/gofont/gomonobold"
+	"golang.org/x/image/font/gofont/gomonobolditalic"
+	"golang.org/x/image/font/gofont/gomonoitalic"
+	"golang.org/x/image/font/gofont/gomono"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 )
@@ -97,6 +102,46 @@ type fontFaces struct {
 	boldItalic font.Face
 }
 
+// systemFontDirs returns platform-specific font search directories.
+// Covers macOS, common Linux distros, and Windows.
+func systemFontDirs() []string {
+	home := os.Getenv("HOME")
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{
+			filepath.Join(home, "Library", "Fonts"),
+			"/Library/Fonts",
+			"/System/Library/Fonts",
+			"/System/Library/Fonts/Supplemental",
+		}
+	case "linux":
+		return []string{
+			filepath.Join(home, ".local", "share", "fonts"),
+			filepath.Join(home, ".fonts"),
+			"/usr/share/fonts/truetype",
+			"/usr/share/fonts/opentype",
+			"/usr/share/fonts/TTF",
+			"/usr/share/fonts",
+			"/usr/local/share/fonts",
+		}
+	case "windows":
+		windir := os.Getenv("WINDIR")
+		if windir == "" {
+			windir = `C:\Windows`
+		}
+		local := os.Getenv("LOCALAPPDATA")
+		dirs := []string{filepath.Join(windir, "Fonts")}
+		if local != "" {
+			dirs = append(dirs, filepath.Join(local, "Microsoft", "Windows", "Fonts"))
+		}
+		return dirs
+	default:
+		return []string{"/usr/share/fonts", "/usr/local/share/fonts"}
+	}
+}
+
+// loadFontFace searches dirs for the first matching candidate filename and
+// returns a parsed font.Face. Returns nil if nothing is found.
 func loadFontFace(searchDirs []string, candidates []string, size float64, dpi float64) font.Face {
 	for _, dir := range searchDirs {
 		for _, name := range candidates {
@@ -123,37 +168,153 @@ func loadFontFace(searchDirs []string, candidates []string, size float64, dpi fl
 	return nil
 }
 
-func loadNerdFontFaces(size float64, dpi float64) fontFaces {
-	searchDirs := []string{
-		filepath.Join(os.Getenv("HOME"), "Library", "Fonts"),
-		"/Library/Fonts",
+// loadEmbeddedFace parses one of the compiled-in Go gofont TTF byte slices.
+// This is the guaranteed last-resort — no files required on disk.
+func loadEmbeddedFace(ttfData []byte, size float64, dpi float64) font.Face {
+	ft, err := opentype.Parse(ttfData)
+	if err != nil {
+		return nil
 	}
+	face, err := opentype.NewFace(ft, &opentype.FaceOptions{
+		Size:    size,
+		DPI:     dpi,
+		Hinting: font.HintingFull,
+	})
+	if err != nil {
+		return nil
+	}
+	return face
+}
 
-	regular := loadFontFace(searchDirs, []string{
+// loadFontFaces builds font faces using a 3-tier priority:
+//  1. Nerd Fonts (user / system installed) — best glyph coverage
+//  2. System monospace fonts for the current OS — reliable fallback
+//  3. Compiled-in Go gomono — absolute last resort, always works
+func loadFontFaces(size float64, dpi float64) fontFaces {
+	dirs := systemFontDirs()
+
+	// ── Tier 1: Nerd Fonts ───────────────────────────────────────────────────
+	nerdRegular := []string{
 		"JetBrainsMonoNerdFontMono-Regular.ttf",
 		"FiraCodeNerdFontMono-Regular.ttf",
 		"HackNerdFontMono-Regular.ttf",
-	}, size, dpi)
-
-	bold := loadFontFace(searchDirs, []string{
+		"HasklugNerdFontMono-Regular.otf",
+		"JetBrainsMonoNLNerdFont-Regular.ttf",
+	}
+	nerdBold := []string{
 		"JetBrainsMonoNerdFontMono-Bold.ttf",
 		"FiraCodeNerdFontMono-Bold.ttf",
 		"HackNerdFontMono-Bold.ttf",
-	}, size, dpi)
-
-	italic := loadFontFace(searchDirs, []string{
+		"HasklugNerdFontMono-Bold.otf",
+		"JetBrainsMonoNLNerdFont-Bold.ttf",
+	}
+	nerdItalic := []string{
 		"JetBrainsMonoNerdFontMono-Italic.ttf",
 		"FiraCodeNerdFontMono-Italic.ttf",
 		"HackNerdFontMono-Italic.ttf",
-	}, size, dpi)
-
-	boldItalic := loadFontFace(searchDirs, []string{
+		"HasklugNerdFontMono-Italic.otf",
+		"JetBrainsMonoNLNerdFont-Italic.ttf",
+	}
+	nerdBoldItalic := []string{
 		"JetBrainsMonoNerdFontMono-BoldItalic.ttf",
 		"FiraCodeNerdFontMono-BoldItalic.ttf",
 		"HackNerdFontMono-BoldItalic.ttf",
-	}, size, dpi)
+		"HasklugNerdFontMono-BoldItalic.otf",
+		"JetBrainsMonoNLNerdFont-BoldItalic.ttf",
+	}
 
-	return fontFaces{regular: regular, bold: bold, italic: italic, boldItalic: boldItalic}
+	// ── Tier 2: System monospace fonts (cross-platform) ──────────────────────
+	// macOS: SF Mono, Menlo, Monaco, Courier New
+	// Linux: DejaVu Sans Mono, Liberation Mono, Ubuntu Mono, Noto Mono
+	// Windows: Cascadia Code, Consolas, Courier New, Lucida Console
+	sysRegular := []string{
+		// macOS
+		"SFNSMono.ttf",
+		"Menlo.ttc",
+		"Monaco.ttf",
+		"Courier New.ttf",
+		"Andale Mono.ttf",
+		// Linux
+		"DejaVuSansMono.ttf",
+		"dejavu/DejaVuSansMono.ttf",
+		"truetype/dejavu/DejaVuSansMono.ttf",
+		"LiberationMono-Regular.ttf",
+		"liberation/LiberationMono-Regular.ttf",
+		"UbuntuMono-Regular.ttf",
+		"ubuntu/UbuntuMono-Regular.ttf",
+		"NotoMono-Regular.ttf",
+		"noto/NotoMono-Regular.ttf",
+		// Windows
+		"CascadiaCode.ttf",
+		"CascadiaMono.ttf",
+		"consola.ttf",
+		"lucon.ttf",
+		"cour.ttf",
+	}
+	sysBold := []string{
+		// macOS — SF Mono has no separate bold file (weight embedded)
+		"CourierNewBold.ttf",
+		"Courier New Bold.ttf",
+		// Linux
+		"DejaVuSansMono-Bold.ttf",
+		"dejavu/DejaVuSansMono-Bold.ttf",
+		"truetype/dejavu/DejaVuSansMono-Bold.ttf",
+		"LiberationMono-Bold.ttf",
+		"liberation/LiberationMono-Bold.ttf",
+		"UbuntuMono-Bold.ttf",
+		"ubuntu/UbuntuMono-Bold.ttf",
+		// Windows
+		"CascadiaCode.ttf",
+		"consolab.ttf",
+		"courbd.ttf",
+	}
+	sysItalic := []string{
+		// macOS
+		"SFNSMonoItalic.ttf",
+		"CourierNewItalic.ttf",
+		"Courier New Italic.ttf",
+		// Linux
+		"DejaVuSansMono-Oblique.ttf",
+		"dejavu/DejaVuSansMono-Oblique.ttf",
+		"truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+		"LiberationMono-Italic.ttf",
+		"liberation/LiberationMono-Italic.ttf",
+		"UbuntuMono-Italic.ttf",
+		"ubuntu/UbuntuMono-Italic.ttf",
+		// Windows
+		"couri.ttf",
+	}
+	sysBoldItalic := []string{
+		"Courier New Bold Italic.ttf",
+		"DejaVuSansMono-BoldOblique.ttf",
+		"dejavu/DejaVuSansMono-BoldOblique.ttf",
+		"truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
+		"LiberationMono-BoldItalic.ttf",
+		"liberation/LiberationMono-BoldItalic.ttf",
+		"UbuntuMono-BoldItalic.ttf",
+		"ubuntu/UbuntuMono-BoldItalic.ttf",
+		"courbi.ttf",
+	}
+
+	// Try Nerd Font first, then system font
+	resolveFace := func(nerd, sys []string, embeddedData []byte) font.Face {
+		if f := loadFontFace(dirs, nerd, size, dpi); f != nil {
+			return f
+		}
+		if f := loadFontFace(dirs, sys, size, dpi); f != nil {
+			return f
+		}
+		// ── Tier 3: embedded Go gomono — always succeeds ──────────────────
+		log.Printf("Font: using embedded Go gomono fallback (DPI: %.1f)", dpi)
+		return loadEmbeddedFace(embeddedData, size, dpi)
+	}
+
+	return fontFaces{
+		regular:    resolveFace(nerdRegular, sysRegular, gomono.TTF),
+		bold:       resolveFace(nerdBold, sysBold, gomonobold.TTF),
+		italic:     resolveFace(nerdItalic, sysItalic, gomonoitalic.TTF),
+		boldItalic: resolveFace(nerdBoldItalic, sysBoldItalic, gomonobolditalic.TTF),
+	}
 }
 
 func measureCell(face font.Face) (cellW, cellH, baseline int) {
@@ -175,7 +336,7 @@ func measureCell(face font.Face) (cellW, cellH, baseline int) {
 
 func NewGUIRenderer(title string, cols, rows int) (*GUIRenderer, error) {
 	scale := ebiten.DeviceScaleFactor()
-	faces := loadNerdFontFaces(12, 96*scale)
+	faces := loadFontFaces(12, 96*scale)
 	cellW, cellH, baseline := measureCell(faces.regular)
 	padX := maxInt(cellW, 12)
 	padY := maxInt(cellH/2, 12)
